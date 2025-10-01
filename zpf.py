@@ -1701,8 +1701,12 @@ def premium_only(func):
 @bot.message_handler(commands=['start'])
 @check_membership
 def handle_start(message, is_edit=False):
+ codex/add-web-version-with-all-features-kvy3ww
     webapp_url = (CONFIG.get("WEBAPP_URL") or "").strip()
     webapp_notice = None
+
+    webapp_url = CONFIG.get("WEBAPP_URL")
+ main
     update_active_user(message.from_user.id)
     
     command_parts = message.text.split(maxsplit=1)
@@ -1758,6 +1762,7 @@ def handle_start(message, is_edit=False):
         types.InlineKeyboardButton("📊 运行状态", callback_data="stats"),
         types.InlineKeyboardButton("🏆 赞助排行", callback_data="leaderboard")
     )
+ codex/add-web-version-with-all-features-kvy3ww
     if webapp_url and is_valid_url(webapp_url):
         if is_secure_webapp_url(webapp_url):
             markup.add(
@@ -1774,6 +1779,13 @@ def handle_start(message, is_edit=False):
 
     if webapp_notice:
         welcome_text.append(f"\n{escape_markdown(webapp_notice)}")
+
+    if webapp_url:
+        markup.add(
+            types.InlineKeyboardButton("🌐 网页版", web_app=types.WebAppInfo(url=webapp_url)),
+            types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url)
+        )
+ main
     final_text = "\n".join(welcome_text) + f"\n\n{ADVERTISEMENT_TEXT}"
     
     if is_edit:

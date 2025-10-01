@@ -337,6 +337,28 @@ def escape_for_code(text: str) -> str:
         text = str(text)
     return text.replace('\\', '\\\\').replace('`', '\\`')
 
+
+# ---------------------- URL 校验工具 ----------------------
+def is_valid_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    return bool(parsed.scheme) and bool(parsed.netloc)
+
+
+def is_secure_webapp_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme.lower() == "https" and bool(parsed.netloc)
+
+
 def _sanitize_for_link_text(text: str) -> str:
     """Removes characters that conflict with Markdown link syntax."""
     if not isinstance(text, str):
@@ -1679,7 +1701,12 @@ def premium_only(func):
 @bot.message_handler(commands=['start'])
 @check_membership
 def handle_start(message, is_edit=False):
+ codex/add-web-version-with-all-features-kvy3ww
+    webapp_url = (CONFIG.get("WEBAPP_URL") or "").strip()
+    webapp_notice = None
+
     webapp_url = CONFIG.get("WEBAPP_URL")
+ main
     update_active_user(message.from_user.id)
     
     command_parts = message.text.split(maxsplit=1)
@@ -1735,11 +1762,30 @@ def handle_start(message, is_edit=False):
         types.InlineKeyboardButton("📊 运行状态", callback_data="stats"),
         types.InlineKeyboardButton("🏆 赞助排行", callback_data="leaderboard")
     )
+ codex/add-web-version-with-all-features-kvy3ww
+    if webapp_url and is_valid_url(webapp_url):
+        if is_secure_webapp_url(webapp_url):
+            markup.add(
+                types.InlineKeyboardButton("🌐 网页版", web_app=types.WebAppInfo(url=webapp_url)),
+                types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url)
+            )
+        else:
+            markup.add(
+                types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url)
+            )
+            webapp_notice = "⚠️ 当前 Web 版仅支持浏览器打开，需配置 HTTPS 才能在 Telegram 内置 WebApp 中使用。"
+    elif webapp_url:
+        webapp_notice = "⚠️ 配置的网页地址无效，请联系管理员更新。"
+
+    if webapp_notice:
+        welcome_text.append(f"\n{escape_markdown(webapp_notice)}")
+
     if webapp_url:
         markup.add(
             types.InlineKeyboardButton("🌐 网页版", web_app=types.WebAppInfo(url=webapp_url)),
             types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url)
         )
+ main
     final_text = "\n".join(welcome_text) + f"\n\n{ADVERTISEMENT_TEXT}"
     
     if is_edit:

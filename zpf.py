@@ -1679,6 +1679,7 @@ def premium_only(func):
 @bot.message_handler(commands=['start'])
 @check_membership
 def handle_start(message, is_edit=False):
+    webapp_url = CONFIG.get("WEBAPP_URL")
     update_active_user(message.from_user.id)
     
     command_parts = message.text.split(maxsplit=1)

@@ -1948,6 +1948,12 @@ def premium_only(func):
 @check_membership
 def handle_start(message, is_edit=False):
     webapp_buttons, webapp_notice = build_webapp_buttons(get_configured_webapp_url())
+ codex/add-web-version-with-all-features-kvy3ww
+    webapp_url = (CONFIG.get("WEBAPP_URL") or "").strip()
+    webapp_notice = None
+
+    webapp_url = CONFIG.get("WEBAPP_URL")
+ main
     update_active_user(message.from_user.id)
     
     command_parts = message.text.split(maxsplit=1)
@@ -2009,6 +2015,30 @@ def handle_start(message, is_edit=False):
 
     if webapp_notice:
         welcome_text.append(f"\n{escape_markdown(webapp_notice)}")
+ codex/add-web-version-with-all-features-kvy3ww
+    if webapp_url and is_valid_url(webapp_url):
+        if is_secure_webapp_url(webapp_url):
+            markup.add(
+                types.InlineKeyboardButton("🌐 网页版", web_app=types.WebAppInfo(url=webapp_url)),
+                types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url)
+            )
+        else:
+            markup.add(
+                types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url)
+            )
+            webapp_notice = "⚠️ 当前 Web 版仅支持浏览器打开，需配置 HTTPS 才能在 Telegram 内置 WebApp 中使用。"
+    elif webapp_url:
+        webapp_notice = "⚠️ 配置的网页地址无效，请联系管理员更新。"
+
+    if webapp_notice:
+        welcome_text.append(f"\n{escape_markdown(webapp_notice)}")
+
+    if webapp_url:
+        markup.add(
+            types.InlineKeyboardButton("🌐 网页版", web_app=types.WebAppInfo(url=webapp_url)),
+            types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url)
+        )
+ main
     final_text = "\n".join(welcome_text) + f"\n\n{ADVERTISEMENT_TEXT}"
     
     if is_edit:
@@ -2832,6 +2862,7 @@ def build_query_report_markdown(summary):
     if scam_hits:
         count_text = escape_markdown(f"({len(scam_hits)} 条)")
         risk_header = f"🔍 *{escape_markdown('风险记录')} {count_text}*"
+        risk_header = f"🔍 *{escape_markdown('风险记录')} \({len(scam_hits)} {escape_markdown('条')}\)*"
         risk_parts = [risk_header]
         for hit in scam_hits:
             title = _sanitize_for_link_text(hit.get('chat_title') or '未知频道')
@@ -2843,6 +2874,7 @@ def build_query_report_markdown(summary):
     if len(history) > 1:
         history_count = escape_markdown(f"({len(history)} 条)")
         history_header = f"📜 *{escape_markdown('历史变动')} {history_count}*"
+        history_header = f"📜 *{escape_markdown('历史变动')} \({len(history)} {escape_markdown('条')}\)*"
         event_blocks = []
         for event in history:
             formatted_time = escape_for_code(event.get('display_time') or '未知')
@@ -2857,6 +2889,7 @@ def build_query_report_markdown(summary):
     if common_groups:
         group_count = escape_markdown(f"({len(common_groups)} 个)")
         group_header = f"👥 *{escape_markdown('共同群组')} {group_count}*"
+        group_header = f"👥 *{escape_markdown('共同群组')} \({len(common_groups)} {escape_markdown('个')}\)*"
         group_lines = []
         for group in common_groups:
             usernames = group.get('usernames') or []
@@ -2872,6 +2905,7 @@ def build_query_report_markdown(summary):
     if bio_history:
         bio_count = escape_markdown(f"({len(bio_history)} 条)")
         bio_header = f"📝 *Bio {escape_markdown('历史')} {bio_count}*"
+        bio_header = f"📝 *Bio {escape_markdown('历史')} \({len(bio_history)} {escape_markdown('条')}\)*"
         lines = []
         for entry in bio_history:
             date_str = escape_for_code(entry.get('display_date') or '未知')
@@ -2883,6 +2917,7 @@ def build_query_report_markdown(summary):
     if phone_history:
         phone_count = escape_markdown(f"({len(phone_history)} 个)")
         phone_header = f"📱 *{escape_markdown('绑定号码')} {phone_count}*"
+        phone_header = f"📱 *{escape_markdown('绑定号码')} \({len(phone_history)} {escape_markdown('个')}\)*"
         phone_lines = [f"› `{escape_for_code(phone)}`" for phone in phone_history]
         parts.append(phone_header + "\n" + "\n".join(phone_lines))
 
@@ -3399,6 +3434,7 @@ def trigger_query_flow(message, query):
         if status == 'resolved_no_data':
             reply_text = (
                 f"📭 {escape_markdown('已识别用户ID ')}{format_inline_code(str(result['resolved_id']))}"
+                f"📭 {escape_markdown('已识别用户ID ')}\`{escape_for_code(str(result['resolved_id']))}\`"
                 f"{escape_markdown('，但未在其历史记录、官方投稿或监控频道中发现任何相关信息。')}"
             )
             bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
@@ -3415,6 +3451,11 @@ def trigger_query_flow(message, query):
             )
             partial_count = escape_markdown(f"({len(partial_hits)} 条)")
             risk_header = f"🔍 *{escape_markdown('风险记录')} {partial_count}*"
+                f"{escape_markdown('无法直接识别用户 ')}\`{escape_for_code(query)}\`"
+                f"{escape_markdown('，可能因为对方隐私设置严格或已注销。')}\n\n"
+                f"{escape_markdown('但是，我们在监控频道中找到了包含此ID或用户名的提及记录:')}"
+            )
+            risk_header = f"🔍 *{escape_markdown('风险记录')} \({len(partial_hits)} {escape_markdown('条')}\)*"
             risk_parts = [risk_header]
             for hit in partial_hits:
                 title = _sanitize_for_link_text(hit.get('chat_title') or '未知频道')
@@ -3428,6 +3469,7 @@ def trigger_query_flow(message, query):
         if status == 'not_found':
             reply_text = (
                 f"📭 {escape_markdown('未在数据库中找到与 ')}{format_inline_code(query)}"
+                f"📭 {escape_markdown('未在数据库中找到与 ')}\`{escape_for_code(query)}\`"
                 f"{escape_markdown(' 相关的任何用户记录，各监控频道中也无相关内容。此用户可能不存在或与诈骗无关。')}"
             )
             bot.reply_to(message, reply_text, parse_mode="MarkdownV2")

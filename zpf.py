@@ -4555,7 +4555,7 @@ if __name__ == '__main__':
             logger.warning(f"⚠️ Telethon 断开连接超时或失败: {e}")
         
         if telethon_loop.is_running():
-             telethon_loop.call_soon_threadsafe(telethon_loop.stop)
+            telethon_loop.call_soon_threadsafe(telethon_loop.stop)
     
     if 'telethon_thread' in locals() and telethon_thread.is_alive():
         logger.info("⏳ 等待 Telethon 线程结束...")

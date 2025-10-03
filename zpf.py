@@ -73,6 +73,7 @@ CONFIG = {
     "OKPAY_TOKEN": "98V6feDUqgvxBCszGHIKNObSYL24Jw7n",  # 请替换为你的 OKPay 商户 Token
     "SERVER_PUBLIC_IP": "38.22.90.236",  # 请替换为你的服务器公网 IP
     "WEBHOOK_PORT": 1010,  # 用于接收支付回调的端口
+    "WEBAPP_CONFIG_FILE": "webapp_config.json",
     # ---------------------- 新增结束 ----------------------
 }
 BOT_VERSION = "v24.8.17.5 | Sponsorship Update"
@@ -506,6 +507,7 @@ def load_json_file(filename, lock):
 def save_json_file(filename, data, lock):
     with lock:
         try:
+            ensure_parent_dir(Path(filename))
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             return True
@@ -555,8 +557,9 @@ def save_channels(channels):
                 except ValueError: pass
         
         unique_channels = sorted(list(set(valid_channels)), key=lambda x: str(x).lower())
-        
+
         try:
+            ensure_parent_dir(Path(CONFIG["CHANNELS_FILE"]))
             with open(CONFIG["CHANNELS_FILE"], "w", encoding="utf-8") as f:
                 json.dump([str(ch) if isinstance(ch, int) else ch for ch in unique_channels], f, ensure_ascii=False, indent=2)
             target_channels = unique_channels
@@ -568,7 +571,7 @@ def save_channels(channels):
 
 # ---------------------- 数据库管理 ----------------------
 def get_db_connection():
-    conn = sqlite3.connect(CONFIG["DATABASE_FILE"], timeout=15, check_same_thread=False)
+    conn = sqlite3.connect(str(CONFIG["DATABASE_FILE"]), timeout=15, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -789,7 +792,7 @@ def init_db():
                 raise e
         
         conn.close()
-    print(f"🗃️ {escape_markdown('数据库初始化完成')} \\({escape_markdown(BOT_VERSION.split('|')[0].strip())} Schema\\)\\.")
+    print(f"🗃️ 数据库初始化完成 ({BOT_VERSION.split('|')[0].strip()} Schema).")
 
 
 # ---------------------- 日志发送逻辑 ----------------------
@@ -1750,6 +1753,7 @@ def handle_start(message, is_edit=False):
         f"`/tougao` {escape_markdown('• 投稿诈骗者信息')}",
         f"`/sponsor` {escape_markdown('• 赞助支持我们')}",
         f"`/leaderboard` {escape_markdown('• 查看赞助排行')}",
+        f"`/webapp` {escape_markdown('• 查看网页状态与配置指引')}",
         f"_/Tip: 直接转发用户消息、发送其用户名或ID，即可快速查询\\./_",
     ])
     
@@ -2129,12 +2133,12 @@ def handle_admin_commands(message):
         current_channels = load_channels()
         if command == '/addchannel':
             if any(str(c).lower() == str(target).lower() for c in current_channels):
-                reply_text = f"{escape_markdown('ℹ️ 频道 ')}\`{escape_for_code(str(target))}\`{escape_markdown(' 已存在。')}"
+                reply_text = f"{escape_markdown('ℹ️ 频道 ')}{format_inline_code(str(target))}{escape_markdown(' 已存在。')}"
                 bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
                 return
             current_channels.append(target)
             if save_channels(current_channels):
-                reply_text = f"✅ {escape_markdown('成功添加 ')}\`{escape_for_code(str(target))}\`{escape_markdown(' 到监控列表。')}"
+                reply_text = f"✅ {escape_markdown('成功添加 ')}{format_inline_code(str(target))}{escape_markdown(' 到监控列表。')}"
                 bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
             else:
                 bot.reply_to(message, escape_markdown(f"❌ 添加失败，无法写入文件。"), parse_mode="MarkdownV2")
@@ -2144,12 +2148,12 @@ def handle_admin_commands(message):
             new_channels = [c for c in current_channels if str(c).lower() != str(target).lower()]
             if len(new_channels) < original_len:
                 if save_channels(new_channels):
-                    reply_text = f"✅ {escape_markdown('成功移除 ')}\`{escape_for_code(str(target))}\`{escape_markdown('。')}"
+                    reply_text = f"✅ {escape_markdown('成功移除 ')}{format_inline_code(str(target))}{escape_markdown('。')}"
                     bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
                 else:
                     bot.reply_to(message, escape_markdown(f"❌ 移除失败，无法写入文件。"), parse_mode="MarkdownV2")
             else:
-                reply_text = f"⚠️ {escape_markdown('未在列表中找到 ')}\`{escape_for_code(str(target))}\`{escape_markdown('。')}"
+                reply_text = f"⚠️ {escape_markdown('未在列表中找到 ')}{format_inline_code(str(target))}{escape_markdown('。')}"
                 bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
     
     elif command == '/listchannels':
@@ -2157,7 +2161,7 @@ def handle_admin_commands(message):
         if not current_channels:
             response_text = escape_markdown("ℹ️ 当前没有设置任何监控频道。")
         else:
-            channels_text = "\n".join([f"📺 `{escape_for_code(str(ch))}`" for ch in current_channels])
+            channels_text = "\n".join([f"📺 {format_inline_code(str(ch))}" for ch in current_channels])
             response_text = f"📝 *{escape_markdown('当前监控的频道/群组列表:')}*\n\n{channels_text}"
         bot.reply_to(message, response_text + f"\n\n{ADVERTISEMENT_TEXT}", parse_mode="MarkdownV2")
 
@@ -2181,10 +2185,10 @@ def handle_admin_commands(message):
         if key_to_delete:
             del reports['verified'][key_to_delete]
             save_reports(reports)
-            reply_text = f"✅ {escape_markdown('成功删除关于 ')}\`{escape_for_code(query)}\`{escape_markdown(' 的已验证报告。')}"
+            reply_text = f"✅ {escape_markdown('成功删除关于 ')}{format_inline_code(query)}{escape_markdown(' 的已验证报告。')}"
             bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
         else:
-            reply_text = f"⚠️ {escape_markdown('未在已验证报告中找到 ')}\`{escape_for_code(query)}\`{escape_markdown('。')}"
+            reply_text = f"⚠️ {escape_markdown('未在已验证报告中找到 ')}{format_inline_code(query)}{escape_markdown('。')}"
             bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
 
     elif command == '/broadcast':
@@ -3387,11 +3391,11 @@ def handle_submission_review(call):
         del reports['pending'][submission_id]
         save_reports(reports)
         
-        edit_text = f"✅ {escape_markdown('已批准投稿 ')}\`{escape_for_code(primary_key)}\`{escape_markdown('。')}"
+        edit_text = f"✅ {escape_markdown('已批准投稿 ')}{format_inline_code(primary_key)}{escape_markdown('。')}"
         bot.edit_message_text(edit_text, call.message.chat.id, call.message.message_id, reply_markup=None, parse_mode="MarkdownV2")
         bot.answer_callback_query(call.id, "已批准")
         try:
-            notify_text = f"🎉 *{escape_markdown('投稿已批准')}*\n{escape_markdown('好消息！您提交的关于')} `{escape_for_code(primary_key)}` {escape_markdown('的投稿已被管理员批准。感谢您的贡献！')}"
+            notify_text = f"🎉 *{escape_markdown('投稿已批准')}*\n{escape_markdown('好消息！您提交的关于')} {format_inline_code(primary_key)} {escape_markdown('的投稿已被管理员批准。感谢您的贡献！')}"
             bot.send_message(submitter_id, notify_text, parse_mode="MarkdownV2")
         except Exception as e:
             print(f"通知用户 {submitter_id} 批准失败: {e}")
@@ -3968,12 +3972,17 @@ def perform_background_scam_check(business_connection_id: str, chat_id: int, bus
         contact_name = (contact_user.first_name or "") + (" " + (contact_user.last_name or "") if contact_user.last_name else "")
         contact_name = contact_name.strip() or f"User ID {contact_id}"
         
-        username_mention = f"@{escape_markdown(contact_user.username)}" if contact_user.username else 'N/A'
+        username_mention = (
+            escape_markdown(f"@{contact_user.username}") if contact_user.username else escape_markdown('N/A')
+        )
+        left_paren = escape_markdown('(')
+        right_paren = escape_markdown(')')
+        pipe_symbol = escape_markdown('|')
 
         warning_message_md = (
             f"🚨 *{escape_markdown('安全警报 (自动检测)')}* 🚨\n\n"
             f"{escape_markdown('联系人')} *{escape_markdown(contact_name)}* "
-            f"\\({username_mention} \\| `{contact_id}`\\) "
+            f"{left_paren}{username_mention} {pipe_symbol} {format_inline_code(str(contact_id))}{right_paren} "
             f"{escape_markdown('存在高风险记录。')}\n\n"
             f"*{escape_markdown('原因:')}* {warning_reason}\n\n"
             f"*{escape_markdown('请谨慎交易，注意防范风险。')}*"
@@ -4466,7 +4475,8 @@ def handle_all_other_messages(message):
             '/start', '/cxzbf', '/stats', '/admin', '/addchannel',
             '/removechannel', '/listchannels', '/tougao', '/delreport',
             DONE_SUBMISSION_COMMAND, '/broadcast', '/cancel_broadcast',
-            '/premium_features', '/jz', '/sponsor', '/leaderboard'
+            '/premium_features', '/jz', '/sponsor', '/leaderboard',
+            '/webapp', '/setwebapp'
         ]
         if message.text.split()[0] not in known_commands:
             bot.reply_to(message, f"🤔 *{escape_markdown('无法识别的命令。')}*\n{escape_markdown('请使用')} /start {escape_markdown('查看可用命令。')}" + f"\n\n{ADVERTISEMENT_TEXT}", parse_mode="MarkdownV2")
@@ -4483,9 +4493,10 @@ if __name__ == '__main__':
         (CONFIG["REPORTS_FILE"], '{"pending": {}, "verified": {}}'),
     ]:
         if not os.path.exists(fname):
+            ensure_parent_dir(Path(fname))
             with open(fname, 'w', encoding='utf-8') as f: f.write(default_content)
             logger.info(f"📄 创建默认文件: {fname}")
-    
+
     init_db()
 
     # --- 启动顺序优化 ---

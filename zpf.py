@@ -381,6 +381,49 @@ def build_webapp_buttons(raw_url: str):
     return buttons, notice
 
 
+def build_webapp_status_report(raw_url: str) -> str:
+    """Return a MarkdownV2 status message about the configured web application URL."""
+    url = (raw_url or "").strip()
+    lines = ["🌐 *" + escape_markdown("网页版本状态") + "*"]
+
+    if not url:
+        lines.append("")
+        lines.append(escape_markdown("当前未配置 Web 版访问地址。"))
+        lines.append(escape_markdown("请在配置中设置 WEBAPP_URL 或通过环境变量覆盖。"))
+        return "\n".join(lines)
+
+    if not is_valid_url(url):
+        lines.append("")
+        lines.append("⚠️ " + escape_markdown("配置的地址无效："))
+        lines.append(f"`{escape_for_code(url)}`")
+        lines.append("")
+        lines.append(escape_markdown("请确认地址格式正确（例如 https://example.com/webapp ）。"))
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("*" + escape_markdown("当前地址") + "*")
+    lines.append(f"`{escape_for_code(url)}`")
+    lines.append("")
+
+    if is_secure_webapp_url(url):
+        lines.append("✅ " + escape_markdown("该地址符合 Telegram WebApp 要求，可直接在机器人内打开。"))
+    else:
+        lines.append("⚠️ " + escape_markdown("该地址不是 HTTPS，因此无法以内嵌 WebApp 打开。"))
+        lines.append("")
+        lines.append("*" + escape_markdown("快速指引") + "*")
+        guidance_steps = [
+            "准备一个指向服务器的域名，并将其解析到当前 IP。",
+            "在服务器上申请有效的 TLS 证书（如使用 Nginx + Certbot 或 Caddy）。",
+            "让 /webapp 路由通过 HTTPS 对外提供服务，并更新配置中的 WEBAPP_URL。",
+        ]
+        for step in guidance_steps:
+            lines.append("• " + escape_markdown(step))
+        lines.append("")
+        lines.append(escape_markdown("完成上述步骤后，可重新发送 /webapp 查看检测结果。"))
+
+    return "\n".join(lines)
+
+
 def _sanitize_for_link_text(text: str) -> str:
     """Removes characters that conflict with Markdown link syntax."""
     if not isinstance(text, str):
@@ -1767,6 +1810,7 @@ def handle_start(message, is_edit=False):
         f"`/tougao` {escape_markdown('• 投稿诈骗者信息')}",
         f"`/sponsor` {escape_markdown('• 赞助支持我们')}",
         f"`/leaderboard` {escape_markdown('• 查看赞助排行')}",
+        f"`/webapp` {escape_markdown('• 查看网页状态与配置指引')}",
         f"_/Tip: 直接转发用户消息、发送其用户名或ID，即可快速查询\\./_",
     ])
     
@@ -1808,6 +1852,13 @@ def handle_sponsor(message):
     bot.reply_to(message, prompt_text, parse_mode="MarkdownV2")
     bot.register_next_step_handler(message, process_sponsor_amount)
 
+
+@bot.message_handler(commands=['webapp'])
+@check_membership
+def handle_webapp_status(message):
+    update_active_user(message.from_user.id)
+    status_text = build_webapp_status_report(CONFIG.get("WEBAPP_URL"))
+    bot.reply_to(message, status_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
 
 
 def create_okpay_order_for_user(user_id: int, amount: float):

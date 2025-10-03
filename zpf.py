@@ -2656,7 +2656,8 @@ def build_query_report_summary(resolved_id, db_history, verified_info, scam_chan
     }
 
     if db_history and db_history.get('current_profile'):
-        profile = db_history['current_profile']
+        profile_raw = db_history['current_profile']
+        profile = dict(profile_raw) if isinstance(profile_raw, sqlite3.Row) else profile_raw
         display_name = (f"{profile.get('first_name') or ''} {profile.get('last_name') or ''}").strip()
         active_usernames = []
         if profile.get('active_usernames_json'):
@@ -3443,6 +3444,20 @@ def trigger_query_flow(message, query):
 
     threading.Thread(target=perform_query_and_send_results, daemon=True).start()
 
+    threading.Thread(target=perform_query_and_send_results, daemon=True).start()
+
+
+def send_query_result(message, resolved_id, report_markdown, verified_info):
+    chat_id = message.chat.id
+    main_text = (report_markdown or '').strip()
+    if main_text:
+        full_message = (
+            f"{main_text}\n\n"
+            "*────────────────────*\n"
+            f"{ADVERTISEMENT_TEXT}"
+        )
+    else:
+        full_message = ADVERTISEMENT_TEXT
 
 def send_query_result(message, resolved_id, report_markdown, verified_info):
     chat_id = message.chat.id

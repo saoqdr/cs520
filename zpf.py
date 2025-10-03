@@ -10,9 +10,11 @@ import copy
 import requests
 import sqlite3
 import io
+from pathlib import Path
 import html
 from datetime import datetime, timezone, timedelta
 import uuid
+import ipaddress
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 from telethon import TelegramClient, events, utils
@@ -82,6 +84,37 @@ DONE_SUBMISSION_COMMAND = "/done"
 # 动态生成回调 URL
 CONFIG["CALLBACK_URL"] = f'http://{CONFIG["SERVER_PUBLIC_IP"]}:{CONFIG["WEBHOOK_PORT"]}/okpay'
 CONFIG["WEBAPP_URL"] = f'http://{CONFIG["SERVER_PUBLIC_IP"]}:{CONFIG["WEBHOOK_PORT"]}/webapp'
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_project_path(candidate: str) -> Path:
+    """Resolve a potentially relative path against the project directory."""
+
+    path = Path(candidate).expanduser()
+    if not path.is_absolute():
+        path = (BASE_DIR / path).resolve()
+    return path
+
+
+def ensure_parent_dir(path: Path):
+    """Make sure the parent directory of *path* exists."""
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # Directory creation best-effort; permission issues will surface on file write.
+        pass
+
+
+WEBAPP_CONFIG_PATH = resolve_project_path(CONFIG.get("WEBAPP_CONFIG_FILE", "webapp_config.json"))
+_webapp_url_loaded = False
+_webapp_url_override = None
+_webapp_url_explicit = False
+
+for _cfg_key in ("CHANNELS_FILE", "REPORTS_FILE", "DATABASE_FILE"):
+    if CONFIG.get(_cfg_key):
+        CONFIG[_cfg_key] = resolve_project_path(CONFIG[_cfg_key])
 
 
 # Manually define all content types for compatibility with any py-telegram-bot-api version
@@ -339,6 +372,88 @@ def escape_for_code(text: str) -> str:
     return text.replace('\\', '\\\\').replace('`', '\\`')
 
 
+def format_inline_code(text: str) -> str:
+    """Wrap the provided text in MarkdownV2 inline code fencing."""
+    return f"`{escape_for_code(text)}`"
+
+
+def get_configured_webapp_url() -> str:
+    """Return the operator-configured WebApp URL, reading overrides when available."""
+    global _webapp_url_loaded, _webapp_url_override, _webapp_url_explicit
+
+    if not _webapp_url_loaded:
+        _webapp_url_loaded = True
+        _webapp_url_override = None
+        _webapp_url_explicit = False
+        try:
+            if WEBAPP_CONFIG_PATH.exists():
+                data = json.loads(WEBAPP_CONFIG_PATH.read_text(encoding='utf-8'))
+                stored = data.get('webapp_url')
+                if stored is None:
+                    stored = ''
+                if isinstance(stored, str):
+                    _webapp_url_override = stored.strip()
+                    _webapp_url_explicit = True
+        except Exception as exc:
+            print(f"⚠️ 无法读取 WebApp 配置文件 {WEBAPP_CONFIG_PATH}: {exc}")
+
+    base_url = (CONFIG.get("WEBAPP_URL") or "").strip()
+    if _webapp_url_explicit:
+        return _webapp_url_override or ""
+    return base_url
+
+
+def set_configured_webapp_url(raw_value: str):
+    """Update the persisted WebApp URL configuration.
+
+    Returns a dictionary describing the result with keys:
+        success (bool)
+        state   ('custom' | 'disabled' | 'default')
+        url     (str | None)
+        error   (str) present only when success is False
+    """
+
+    global _webapp_url_loaded, _webapp_url_override, _webapp_url_explicit
+
+    target_url, hint = normalize_webapp_url_input(raw_value)
+
+    if target_url not in {None, ""} and not is_valid_url(target_url):
+        return {
+            'success': False,
+            'error': 'invalid_url',
+            'url': target_url
+        }
+
+    try:
+        if target_url is None:
+            if WEBAPP_CONFIG_PATH.exists():
+                WEBAPP_CONFIG_PATH.unlink()
+            _webapp_url_override = None
+            _webapp_url_explicit = False
+            state = 'default'
+        else:
+            payload = {'webapp_url': target_url}
+            ensure_parent_dir(WEBAPP_CONFIG_PATH)
+            WEBAPP_CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+            _webapp_url_override = target_url.strip()
+            _webapp_url_explicit = True
+            state = 'disabled' if not _webapp_url_override else 'custom'
+
+        _webapp_url_loaded = True
+        return {
+            'success': True,
+            'state': state,
+            'url': _webapp_url_override if _webapp_url_explicit else None,
+            'normalization_hint': hint
+        }
+    except Exception as exc:
+        return {
+            'success': False,
+            'error': str(exc),
+            'url': target_url
+        }
+
+
 # ---------------------- URL 校验工具 ----------------------
 def is_valid_url(url: str) -> bool:
     if not url:
@@ -350,6 +465,66 @@ def is_valid_url(url: str) -> bool:
     return bool(parsed.scheme) and bool(parsed.netloc)
 
 
+HOST_LABEL_RE = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+
+
+def is_probable_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def is_probable_domain(host: str) -> bool:
+    if not host or len(host) > 253 or host.endswith('.'):
+        return False
+    labels = host.split('.')
+    if len(labels) < 2:
+        return False
+    return all(HOST_LABEL_RE.match(label) for label in labels)
+
+
+def normalize_webapp_url_input(raw_value: str):
+    """Normalize administrator input for the WebApp URL command.
+
+    Returns a tuple ``(normalized_value, hint)`` where ``hint`` describes any
+    automatic transformation that was applied. ``normalized_value`` may be
+    ``None`` (reset to default) or an empty string (disable).
+    """
+
+    if raw_value is None:
+        raw_value = ""
+
+    value = raw_value.strip()
+    lowered = value.lower()
+
+    if lowered in {"default", "reset"}:
+        return None, "default"
+    if lowered in {"", "disable", "none", "off"}:
+        return "", "disabled"
+
+    if lowered in {"auto", "https-auto", "https"}:
+        https_url = f"https://{CONFIG['SERVER_PUBLIC_IP']}/webapp"
+        return https_url, "auto_https"
+    if lowered in {"http-auto"}:
+        http_url = f"http://{CONFIG['SERVER_PUBLIC_IP']}:{CONFIG['WEBHOOK_PORT']}/webapp"
+        return http_url, "auto_http"
+
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme:
+        return value, None
+
+    candidate = value.lstrip('/')
+    guessed = f"https://{candidate}"
+    parsed_guess = urllib.parse.urlparse(guessed)
+    host = parsed_guess.hostname or ""
+    if host and (is_probable_ip(host) or is_probable_domain(host)):
+        return guessed, "guessed_https"
+
+    return value, None
+
+
 def is_secure_webapp_url(url: str) -> bool:
     if not url:
         return False
@@ -358,6 +533,74 @@ def is_secure_webapp_url(url: str) -> bool:
     except ValueError:
         return False
     return parsed.scheme.lower() == "https" and bool(parsed.netloc)
+
+
+def build_webapp_buttons(raw_url: str):
+    """Prepare safe inline keyboard buttons and notice for the web application."""
+    webapp_url = (raw_url or "").strip()
+    if not webapp_url:
+        return [], None
+
+    if not is_valid_url(webapp_url):
+        return [], "⚠️ 配置的网页地址无效，请联系管理员更新。"
+
+    buttons = []
+    notice = None
+
+    if is_secure_webapp_url(webapp_url):
+        buttons.append(types.InlineKeyboardButton("🌐 网页版", web_app=types.WebAppInfo(url=webapp_url)))
+        buttons.append(types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url))
+    else:
+        buttons.append(types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url))
+        notice = "⚠️ 当前 Web 版仅支持浏览器打开，需配置 HTTPS 才能在 Telegram 内置 WebApp 中使用。"
+
+    return buttons, notice
+
+
+def build_webapp_status_report(raw_url: str) -> str:
+    """Return a MarkdownV2 status message about the configured web application URL."""
+    url = (raw_url or "").strip()
+    lines = ["🌐 *" + escape_markdown("网页版本状态") + "*"]
+
+    if not url:
+        lines.append("")
+        lines.append(escape_markdown("当前未配置 Web 版访问地址。"))
+        lines.append(escape_markdown("请在配置中设置 WEBAPP_URL 或通过环境变量覆盖。"))
+        return "\n".join(lines)
+
+    if not is_valid_url(url):
+        lines.append("")
+        lines.append("⚠️ " + escape_markdown("配置的地址无效："))
+        lines.append(f"`{escape_for_code(url)}`")
+        lines.append("")
+        lines.append(escape_markdown("请确认地址格式正确（例如 https://example.com/webapp ）。"))
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("*" + escape_markdown("当前地址") + "*")
+    lines.append(f"`{escape_for_code(url)}`")
+    lines.append("")
+
+    if is_secure_webapp_url(url):
+        lines.append("✅ " + escape_markdown("该地址符合 Telegram WebApp 要求，可直接在机器人内打开。"))
+    else:
+        lines.append("⚠️ " + escape_markdown("该地址不是 HTTPS，因此无法以内嵌 WebApp 打开。"))
+        lines.append("")
+        lines.append("*" + escape_markdown("快速指引") + "*")
+        guidance_steps = [
+            "准备一个指向服务器的域名，并将其解析到当前 IP。",
+            "在服务器上申请有效的 TLS 证书（如使用 Nginx + Certbot 或 Caddy）。",
+            "让 /webapp 路由通过 HTTPS 对外提供服务，并更新配置中的 WEBAPP_URL。",
+        ]
+        for step in guidance_steps:
+            lines.append("• " + escape_markdown(step))
+        lines.append("")
+        lines.append(escape_markdown("完成上述步骤后，可重新发送 /webapp 查看检测结果。"))
+
+    lines.append("")
+    lines.append(escape_markdown("管理员可发送 /setwebapp 查看或更新网页地址。"))
+    lines.append(escape_markdown("示例：/setwebapp auto 或 /setwebapp https://example.com/webapp"))
+    return "\n".join(lines)
 
 
 def _sanitize_for_link_text(text: str) -> str:
@@ -1704,6 +1947,7 @@ def premium_only(func):
 @bot.message_handler(commands=['start'])
 @check_membership
 def handle_start(message, is_edit=False):
+    webapp_buttons, webapp_notice = build_webapp_buttons(get_configured_webapp_url())
  codex/add-web-version-with-all-features-kvy3ww
     webapp_url = (CONFIG.get("WEBAPP_URL") or "").strip()
     webapp_notice = None
@@ -1766,6 +2010,11 @@ def handle_start(message, is_edit=False):
         types.InlineKeyboardButton("📊 运行状态", callback_data="stats"),
         types.InlineKeyboardButton("🏆 赞助排行", callback_data="leaderboard")
     )
+    if webapp_buttons:
+        markup.add(*webapp_buttons)
+
+    if webapp_notice:
+        welcome_text.append(f"\n{escape_markdown(webapp_notice)}")
  codex/add-web-version-with-all-features-kvy3ww
     if webapp_url and is_valid_url(webapp_url):
         if is_secure_webapp_url(webapp_url):
@@ -1814,6 +2063,74 @@ def handle_sponsor(message):
     bot.reply_to(message, prompt_text, parse_mode="MarkdownV2")
     bot.register_next_step_handler(message, process_sponsor_amount)
 
+
+@bot.message_handler(commands=['webapp'])
+@check_membership
+def handle_webapp_status(message):
+    update_active_user(message.from_user.id)
+    status_text = build_webapp_status_report(get_configured_webapp_url())
+    bot.reply_to(message, status_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=['setwebapp'])
+@check_membership
+def handle_set_webapp(message):
+    update_active_user(message.from_user.id)
+
+    if message.from_user.id != CONFIG.get("ADMIN_ID"):
+        bot.reply_to(
+            message,
+            escape_markdown("🚫 仅管理员可以修改网页版本配置。"),
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) == 1:
+        status_text = build_webapp_status_report(get_configured_webapp_url())
+        usage_lines = [
+            "ℹ️ *" + escape_markdown("配置指引") + "*",
+            "`/setwebapp https://example.com/webapp`",
+            "`/setwebapp auto` - " + escape_markdown("使用服务器公网 IP 生成 HTTPS 地址"),
+            "`/setwebapp http-auto` - " + escape_markdown("生成 HTTP 地址 (不推荐)"),
+            "`/setwebapp disable` - " + escape_markdown("暂时关闭按钮"),
+            "`/setwebapp default` - " + escape_markdown("恢复为默认地址"),
+        ]
+        reply_text = status_text + "\n\n" + "\n".join(usage_lines)
+        bot.reply_to(message, reply_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
+        return
+
+    result = set_configured_webapp_url(parts[1])
+    if not result.get('success'):
+        error = result.get('error')
+        if error == 'invalid_url':
+            msg = escape_markdown("❌ URL 无效，请提供以 http:// 或 https:// 开头的完整地址。")
+        else:
+            msg = escape_markdown(f"❌ 保存失败: {error}")
+        bot.reply_to(message, msg, parse_mode="MarkdownV2")
+        return
+
+    state = result.get('state')
+    if state == 'custom':
+        notice = f"✅ *{escape_markdown('已更新 WebApp 地址。')}*"
+    elif state == 'disabled':
+        notice = f"✅ *{escape_markdown('已禁用 WebApp 按钮。')}*"
+    else:
+        notice = f"✅ *{escape_markdown('已恢复默认配置。')}*"
+
+    hint_messages = {
+        'auto_https': escape_markdown("已根据服务器公网 IP 自动生成 HTTPS 链接。"),
+        'auto_http': escape_markdown("已根据服务器公网 IP 自动生成 HTTP 链接。"),
+        'guessed_https': escape_markdown("检测到缺少协议，已自动补全为 HTTPS。"),
+    }
+
+    hint = result.get('normalization_hint')
+    if hint in hint_messages:
+        notice += "\n" + hint_messages[hint]
+
+    status_text = build_webapp_status_report(get_configured_webapp_url())
+    reply_text = notice + "\n\n" + status_text
+    bot.reply_to(message, reply_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
 
 
 def create_okpay_order_for_user(user_id: int, amount: float):
@@ -2543,6 +2860,8 @@ def build_query_report_markdown(summary):
 
     scam_hits = summary.get('scam_hits') or []
     if scam_hits:
+        count_text = escape_markdown(f"({len(scam_hits)} 条)")
+        risk_header = f"🔍 *{escape_markdown('风险记录')} {count_text}*"
         risk_header = f"🔍 *{escape_markdown('风险记录')} \({len(scam_hits)} {escape_markdown('条')}\)*"
         risk_parts = [risk_header]
         for hit in scam_hits:
@@ -2553,6 +2872,8 @@ def build_query_report_markdown(summary):
 
     history = summary.get('history') or []
     if len(history) > 1:
+        history_count = escape_markdown(f"({len(history)} 条)")
+        history_header = f"📜 *{escape_markdown('历史变动')} {history_count}*"
         history_header = f"📜 *{escape_markdown('历史变动')} \({len(history)} {escape_markdown('条')}\)*"
         event_blocks = []
         for event in history:
@@ -2566,6 +2887,8 @@ def build_query_report_markdown(summary):
 
     common_groups = summary.get('common_groups') or []
     if common_groups:
+        group_count = escape_markdown(f"({len(common_groups)} 个)")
+        group_header = f"👥 *{escape_markdown('共同群组')} {group_count}*"
         group_header = f"👥 *{escape_markdown('共同群组')} \({len(common_groups)} {escape_markdown('个')}\)*"
         group_lines = []
         for group in common_groups:
@@ -2580,6 +2903,8 @@ def build_query_report_markdown(summary):
 
     bio_history = summary.get('bio_history') or []
     if bio_history:
+        bio_count = escape_markdown(f"({len(bio_history)} 条)")
+        bio_header = f"📝 *Bio {escape_markdown('历史')} {bio_count}*"
         bio_header = f"📝 *Bio {escape_markdown('历史')} \({len(bio_history)} {escape_markdown('条')}\)*"
         lines = []
         for entry in bio_history:
@@ -2590,6 +2915,8 @@ def build_query_report_markdown(summary):
 
     phone_history = summary.get('phone_history') or []
     if phone_history:
+        phone_count = escape_markdown(f"({len(phone_history)} 个)")
+        phone_header = f"📱 *{escape_markdown('绑定号码')} {phone_count}*"
         phone_header = f"📱 *{escape_markdown('绑定号码')} \({len(phone_history)} {escape_markdown('个')}\)*"
         phone_lines = [f"› `{escape_for_code(phone)}`" for phone in phone_history]
         parts.append(phone_header + "\n" + "\n".join(phone_lines))
@@ -3106,6 +3433,7 @@ def trigger_query_flow(message, query):
 
         if status == 'resolved_no_data':
             reply_text = (
+                f"📭 {escape_markdown('已识别用户ID ')}{format_inline_code(str(result['resolved_id']))}"
                 f"📭 {escape_markdown('已识别用户ID ')}\`{escape_for_code(str(result['resolved_id']))}\`"
                 f"{escape_markdown('，但未在其历史记录、官方投稿或监控频道中发现任何相关信息。')}"
             )
@@ -3117,6 +3445,12 @@ def trigger_query_flow(message, query):
             partial_hits = result.get('partial_hits', [])
             header = (
                 f"⚠️ *{escape_markdown('部分匹配结果')}*\n"
+                f"{escape_markdown('无法直接识别用户 ')}{format_inline_code(query)}"
+                f"{escape_markdown('，可能因为对方隐私设置严格或已注销。')}\n\n"
+                f"{escape_markdown('但是，我们在监控频道中找到了包含此ID或用户名的提及记录:')}"
+            )
+            partial_count = escape_markdown(f"({len(partial_hits)} 条)")
+            risk_header = f"🔍 *{escape_markdown('风险记录')} {partial_count}*"
                 f"{escape_markdown('无法直接识别用户 ')}\`{escape_for_code(query)}\`"
                 f"{escape_markdown('，可能因为对方隐私设置严格或已注销。')}\n\n"
                 f"{escape_markdown('但是，我们在监控频道中找到了包含此ID或用户名的提及记录:')}"
@@ -3134,6 +3468,7 @@ def trigger_query_flow(message, query):
 
         if status == 'not_found':
             reply_text = (
+                f"📭 {escape_markdown('未在数据库中找到与 ')}{format_inline_code(query)}"
                 f"📭 {escape_markdown('未在数据库中找到与 ')}\`{escape_for_code(query)}\`"
                 f"{escape_markdown(' 相关的任何用户记录，各监控频道中也无相关内容。此用户可能不存在或与诈骗无关。')}"
             )

@@ -3444,6 +3444,20 @@ def trigger_query_flow(message, query):
 
     threading.Thread(target=perform_query_and_send_results, daemon=True).start()
 
+    threading.Thread(target=perform_query_and_send_results, daemon=True).start()
+
+
+def send_query_result(message, resolved_id, report_markdown, verified_info):
+    chat_id = message.chat.id
+    main_text = (report_markdown or '').strip()
+    if main_text:
+        full_message = (
+            f"{main_text}\n\n"
+            "*────────────────────*\n"
+            f"{ADVERTISEMENT_TEXT}"
+        )
+    else:
+        full_message = ADVERTISEMENT_TEXT
 
 def send_query_result(message, resolved_id, report_markdown, verified_info):
     chat_id = message.chat.id

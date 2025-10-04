@@ -10,8 +10,11 @@ import copy
 import requests
 import sqlite3
 import io
+from pathlib import Path
+import html
 from datetime import datetime, timezone, timedelta
 import uuid
+import ipaddress
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 from telethon import TelegramClient, events, utils
@@ -72,6 +75,7 @@ CONFIG = {
     "OKPAY_TOKEN": "98V6feDUqgvxBCszGHIKNObSYL24Jw7n",  # 请替换为你的 OKPay 商户 Token
     "SERVER_PUBLIC_IP": "38.22.90.236",  # 请替换为你的服务器公网 IP
     "WEBHOOK_PORT": 1010,  # 用于接收支付回调的端口
+    "WEBAPP_CONFIG_FILE": "webapp_config.json",
     # ---------------------- 新增结束 ----------------------
 }
 BOT_VERSION = "v24.8.17.5 | Sponsorship Update"
@@ -79,6 +83,46 @@ DONE_SUBMISSION_COMMAND = "/done"
 
 # 动态生成回调 URL
 CONFIG["CALLBACK_URL"] = f'http://{CONFIG["SERVER_PUBLIC_IP"]}:{CONFIG["WEBHOOK_PORT"]}/okpay'
+CONFIG["WEBAPP_URL"] = f'http://{CONFIG["SERVER_PUBLIC_IP"]}:{CONFIG["WEBHOOK_PORT"]}/webapp'
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_project_path(candidate: str) -> Path:
+    """Resolve a potentially relative path against the project directory."""
+
+    path = Path(candidate).expanduser()
+    if not path.is_absolute():
+        path = (BASE_DIR / path).resolve()
+    return path
+
+
+def ensure_parent_dir(path: Path):
+    """Make sure the parent directory of *path* exists."""
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # Directory creation best-effort; permission issues will surface on file write.
+        pass
+
+
+WEBAPP_CONFIG_PATH = resolve_project_path(CONFIG.get("WEBAPP_CONFIG_FILE", "webapp_config.json"))
+_webapp_url_loaded = False
+_webapp_url_override = None
+_webapp_url_explicit = False
+
+
+def row_to_dict(row):
+    """Safely convert a sqlite3.Row (or mapping) into a plain dict."""
+
+    if isinstance(row, sqlite3.Row):
+        return {key: row[key] for key in row.keys()}
+    return row
+
+for _cfg_key in ("CHANNELS_FILE", "REPORTS_FILE", "DATABASE_FILE"):
+    if CONFIG.get(_cfg_key):
+        CONFIG[_cfg_key] = resolve_project_path(CONFIG[_cfg_key])
 
 
 # Manually define all content types for compatibility with any py-telegram-bot-api version
@@ -335,6 +379,238 @@ def escape_for_code(text: str) -> str:
         text = str(text)
     return text.replace('\\', '\\\\').replace('`', '\\`')
 
+
+def format_inline_code(text: str) -> str:
+    """Wrap the provided text in MarkdownV2 inline code fencing."""
+    return f"`{escape_for_code(text)}`"
+
+
+def get_configured_webapp_url() -> str:
+    """Return the operator-configured WebApp URL, reading overrides when available."""
+    global _webapp_url_loaded, _webapp_url_override, _webapp_url_explicit
+
+    if not _webapp_url_loaded:
+        _webapp_url_loaded = True
+        _webapp_url_override = None
+        _webapp_url_explicit = False
+        try:
+            if WEBAPP_CONFIG_PATH.exists():
+                data = json.loads(WEBAPP_CONFIG_PATH.read_text(encoding='utf-8'))
+                stored = data.get('webapp_url')
+                if stored is None:
+                    stored = ''
+                if isinstance(stored, str):
+                    _webapp_url_override = stored.strip()
+                    _webapp_url_explicit = True
+        except Exception as exc:
+            print(f"⚠️ 无法读取 WebApp 配置文件 {WEBAPP_CONFIG_PATH}: {exc}")
+
+    base_url = (CONFIG.get("WEBAPP_URL") or "").strip()
+    if _webapp_url_explicit:
+        return _webapp_url_override or ""
+    return base_url
+
+
+def set_configured_webapp_url(raw_value: str):
+    """Update the persisted WebApp URL configuration.
+
+    Returns a dictionary describing the result with keys:
+        success (bool)
+        state   ('custom' | 'disabled' | 'default')
+        url     (str | None)
+        error   (str) present only when success is False
+    """
+
+    global _webapp_url_loaded, _webapp_url_override, _webapp_url_explicit
+
+    target_url, hint = normalize_webapp_url_input(raw_value)
+
+    if target_url not in {None, ""} and not is_valid_url(target_url):
+        return {
+            'success': False,
+            'error': 'invalid_url',
+            'url': target_url
+        }
+
+    try:
+        if target_url is None:
+            if WEBAPP_CONFIG_PATH.exists():
+                WEBAPP_CONFIG_PATH.unlink()
+            _webapp_url_override = None
+            _webapp_url_explicit = False
+            state = 'default'
+        else:
+            payload = {'webapp_url': target_url}
+            ensure_parent_dir(WEBAPP_CONFIG_PATH)
+            WEBAPP_CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+            _webapp_url_override = target_url.strip()
+            _webapp_url_explicit = True
+            state = 'disabled' if not _webapp_url_override else 'custom'
+
+        _webapp_url_loaded = True
+        return {
+            'success': True,
+            'state': state,
+            'url': _webapp_url_override if _webapp_url_explicit else None,
+            'normalization_hint': hint
+        }
+    except Exception as exc:
+        return {
+            'success': False,
+            'error': str(exc),
+            'url': target_url
+        }
+
+
+# ---------------------- URL 校验工具 ----------------------
+def is_valid_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    return bool(parsed.scheme) and bool(parsed.netloc)
+
+
+HOST_LABEL_RE = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+
+
+def is_probable_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def is_probable_domain(host: str) -> bool:
+    if not host or len(host) > 253 or host.endswith('.'):
+        return False
+    labels = host.split('.')
+    if len(labels) < 2:
+        return False
+    return all(HOST_LABEL_RE.match(label) for label in labels)
+
+
+def normalize_webapp_url_input(raw_value: str):
+    """Normalize administrator input for the WebApp URL command.
+
+    Returns a tuple ``(normalized_value, hint)`` where ``hint`` describes any
+    automatic transformation that was applied. ``normalized_value`` may be
+    ``None`` (reset to default) or an empty string (disable).
+    """
+
+    if raw_value is None:
+        raw_value = ""
+
+    value = raw_value.strip()
+    lowered = value.lower()
+
+    if lowered in {"default", "reset"}:
+        return None, "default"
+    if lowered in {"", "disable", "none", "off"}:
+        return "", "disabled"
+
+    if lowered in {"auto", "https-auto", "https"}:
+        https_url = f"https://{CONFIG['SERVER_PUBLIC_IP']}/webapp"
+        return https_url, "auto_https"
+    if lowered in {"http-auto"}:
+        http_url = f"http://{CONFIG['SERVER_PUBLIC_IP']}:{CONFIG['WEBHOOK_PORT']}/webapp"
+        return http_url, "auto_http"
+
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme:
+        return value, None
+
+    candidate = value.lstrip('/')
+    guessed = f"https://{candidate}"
+    parsed_guess = urllib.parse.urlparse(guessed)
+    host = parsed_guess.hostname or ""
+    if host and (is_probable_ip(host) or is_probable_domain(host)):
+        return guessed, "guessed_https"
+
+    return value, None
+
+
+def is_secure_webapp_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme.lower() == "https" and bool(parsed.netloc)
+
+
+def build_webapp_buttons(raw_url: str):
+    """Prepare safe inline keyboard buttons and notice for the web application."""
+    webapp_url = (raw_url or "").strip()
+    if not webapp_url:
+        return [], None
+
+    if not is_valid_url(webapp_url):
+        return [], "⚠️ 配置的网页地址无效，请联系管理员更新。"
+
+    buttons = []
+    notice = None
+
+    if is_secure_webapp_url(webapp_url):
+        buttons.append(types.InlineKeyboardButton("🌐 网页版", web_app=types.WebAppInfo(url=webapp_url)))
+        buttons.append(types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url))
+    else:
+        buttons.append(types.InlineKeyboardButton("🔗 浏览器打开", url=webapp_url))
+        notice = "⚠️ 当前 Web 版仅支持浏览器打开，需配置 HTTPS 才能在 Telegram 内置 WebApp 中使用。"
+
+    return buttons, notice
+
+
+def build_webapp_status_report(raw_url: str) -> str:
+    """Return a MarkdownV2 status message about the configured web application URL."""
+    url = (raw_url or "").strip()
+    lines = ["🌐 *" + escape_markdown("网页版本状态") + "*"]
+
+    if not url:
+        lines.append("")
+        lines.append(escape_markdown("当前未配置 Web 版访问地址。"))
+        lines.append(escape_markdown("请在配置中设置 WEBAPP_URL 或通过环境变量覆盖。"))
+        return "\n".join(lines)
+
+    if not is_valid_url(url):
+        lines.append("")
+        lines.append("⚠️ " + escape_markdown("配置的地址无效："))
+        lines.append(f"`{escape_for_code(url)}`")
+        lines.append("")
+        lines.append(escape_markdown("请确认地址格式正确（例如 https://example.com/webapp ）。"))
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("*" + escape_markdown("当前地址") + "*")
+    lines.append(f"`{escape_for_code(url)}`")
+    lines.append("")
+
+    if is_secure_webapp_url(url):
+        lines.append("✅ " + escape_markdown("该地址符合 Telegram WebApp 要求，可直接在机器人内打开。"))
+    else:
+        lines.append("⚠️ " + escape_markdown("该地址不是 HTTPS，因此无法以内嵌 WebApp 打开。"))
+        lines.append("")
+        lines.append("*" + escape_markdown("快速指引") + "*")
+        guidance_steps = [
+            "准备一个指向服务器的域名，并将其解析到当前 IP。",
+            "在服务器上申请有效的 TLS 证书（如使用 Nginx + Certbot 或 Caddy）。",
+            "让 /webapp 路由通过 HTTPS 对外提供服务，并更新配置中的 WEBAPP_URL。",
+        ]
+        for step in guidance_steps:
+            lines.append("• " + escape_markdown(step))
+        lines.append("")
+        lines.append(escape_markdown("完成上述步骤后，可重新发送 /webapp 查看检测结果。"))
+
+    lines.append("")
+    lines.append(escape_markdown("管理员可发送 /setwebapp 查看或更新网页地址。"))
+    lines.append(escape_markdown("示例：/setwebapp auto 或 /setwebapp https://example.com/webapp"))
+    return "\n".join(lines)
+
+
 def _sanitize_for_link_text(text: str) -> str:
     """Removes characters that conflict with Markdown link syntax."""
     if not isinstance(text, str):
@@ -443,6 +719,20 @@ AD_TEXT_PREFIX = (
 )
 ADVERTISEMENT_TEXT = AD_TEXT_PREFIX
 
+
+def get_advertisement_html():
+    contact_link = f"https://t.me/{AD_CONTACT_ADMIN.lstrip('@')}"
+    channel_link = f"https://t.me/{AD_OFFICIAL_CHANNEL.lstrip('@')}"
+    business_link = AD_BUSINESS_SITE
+    return (
+        '<div class="ad">👑 作者 '
+        f'<a href="{contact_link}" target="_blank">{html.escape(AD_CONTACT_ADMIN)}</a>'
+        ' | 📢 频道 '
+        f'<a href="{channel_link}" target="_blank">{html.escape(AD_OFFICIAL_CHANNEL)}</a>'
+        ' | 🌐 业务 '
+        f'<a href="{business_link}" target="_blank">官网</a></div>'
+    )
+
 def get_hitokoto():
     try:
         response = requests.get("https://v1.hitokoto.cn/", timeout=5)
@@ -468,6 +758,7 @@ def load_json_file(filename, lock):
 def save_json_file(filename, data, lock):
     with lock:
         try:
+            ensure_parent_dir(Path(filename))
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             return True
@@ -517,8 +808,9 @@ def save_channels(channels):
                 except ValueError: pass
         
         unique_channels = sorted(list(set(valid_channels)), key=lambda x: str(x).lower())
-        
+
         try:
+            ensure_parent_dir(Path(CONFIG["CHANNELS_FILE"]))
             with open(CONFIG["CHANNELS_FILE"], "w", encoding="utf-8") as f:
                 json.dump([str(ch) if isinstance(ch, int) else ch for ch in unique_channels], f, ensure_ascii=False, indent=2)
             target_channels = unique_channels
@@ -530,7 +822,7 @@ def save_channels(channels):
 
 # ---------------------- 数据库管理 ----------------------
 def get_db_connection():
-    conn = sqlite3.connect(CONFIG["DATABASE_FILE"], timeout=15, check_same_thread=False)
+    conn = sqlite3.connect(str(CONFIG["DATABASE_FILE"]), timeout=15, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -751,7 +1043,7 @@ def init_db():
                 raise e
         
         conn.close()
-    print(f"🗃️ {escape_markdown('数据库初始化完成')} \\({escape_markdown(BOT_VERSION.split('|')[0].strip())} Schema\\)\\.")
+    print(f"🗃️ 数据库初始化完成 ({BOT_VERSION.split('|')[0].strip()} Schema).")
 
 
 # ---------------------- 日志发送逻辑 ----------------------
@@ -1096,7 +1388,7 @@ def query_user_history_from_db(user_id: int):
         if not current_profile:
             conn.close()
             return None
-        history['current_profile'] = current_profile
+        history['current_profile'] = row_to_dict(current_profile)
 
         all_events = []
         c.execute("SELECT change_date, new_username as detail FROM username_history WHERE user_id = ?", (user_id,))
@@ -1663,6 +1955,7 @@ def premium_only(func):
 @bot.message_handler(commands=['start'])
 @check_membership
 def handle_start(message, is_edit=False):
+    webapp_buttons, webapp_notice = build_webapp_buttons(get_configured_webapp_url())
     update_active_user(message.from_user.id)
     
     command_parts = message.text.split(maxsplit=1)
@@ -1706,6 +1999,7 @@ def handle_start(message, is_edit=False):
         f"`/tougao` {escape_markdown('• 投稿诈骗者信息')}",
         f"`/sponsor` {escape_markdown('• 赞助支持我们')}",
         f"`/leaderboard` {escape_markdown('• 查看赞助排行')}",
+        f"`/webapp` {escape_markdown('• 查看网页状态与配置指引')}",
         f"_/Tip: 直接转发用户消息、发送其用户名或ID，即可快速查询\\./_",
     ])
     
@@ -1718,6 +2012,11 @@ def handle_start(message, is_edit=False):
         types.InlineKeyboardButton("📊 运行状态", callback_data="stats"),
         types.InlineKeyboardButton("🏆 赞助排行", callback_data="leaderboard")
     )
+    if webapp_buttons:
+        markup.add(*webapp_buttons)
+
+    if webapp_notice:
+        welcome_text.append(f"\n{escape_markdown(webapp_notice)}")
     final_text = "\n".join(welcome_text) + f"\n\n{ADVERTISEMENT_TEXT}"
     
     if is_edit:
@@ -1741,6 +2040,109 @@ def handle_sponsor(message):
     )
     bot.reply_to(message, prompt_text, parse_mode="MarkdownV2")
     bot.register_next_step_handler(message, process_sponsor_amount)
+
+
+@bot.message_handler(commands=['webapp'])
+@check_membership
+def handle_webapp_status(message):
+    update_active_user(message.from_user.id)
+    status_text = build_webapp_status_report(get_configured_webapp_url())
+    bot.reply_to(message, status_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
+
+
+@bot.message_handler(commands=['setwebapp'])
+@check_membership
+def handle_set_webapp(message):
+    update_active_user(message.from_user.id)
+
+    if message.from_user.id != CONFIG.get("ADMIN_ID"):
+        bot.reply_to(
+            message,
+            escape_markdown("🚫 仅管理员可以修改网页版本配置。"),
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) == 1:
+        status_text = build_webapp_status_report(get_configured_webapp_url())
+        usage_lines = [
+            "ℹ️ *" + escape_markdown("配置指引") + "*",
+            "`/setwebapp https://example.com/webapp`",
+            "`/setwebapp auto` - " + escape_markdown("使用服务器公网 IP 生成 HTTPS 地址"),
+            "`/setwebapp http-auto` - " + escape_markdown("生成 HTTP 地址 (不推荐)"),
+            "`/setwebapp disable` - " + escape_markdown("暂时关闭按钮"),
+            "`/setwebapp default` - " + escape_markdown("恢复为默认地址"),
+        ]
+        reply_text = status_text + "\n\n" + "\n".join(usage_lines)
+        bot.reply_to(message, reply_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
+        return
+
+    result = set_configured_webapp_url(parts[1])
+    if not result.get('success'):
+        error = result.get('error')
+        if error == 'invalid_url':
+            msg = escape_markdown("❌ URL 无效，请提供以 http:// 或 https:// 开头的完整地址。")
+        else:
+            msg = escape_markdown(f"❌ 保存失败: {error}")
+        bot.reply_to(message, msg, parse_mode="MarkdownV2")
+        return
+
+    state = result.get('state')
+    if state == 'custom':
+        notice = f"✅ *{escape_markdown('已更新 WebApp 地址。')}*"
+    elif state == 'disabled':
+        notice = f"✅ *{escape_markdown('已禁用 WebApp 按钮。')}*"
+    else:
+        notice = f"✅ *{escape_markdown('已恢复默认配置。')}*"
+
+    hint_messages = {
+        'auto_https': escape_markdown("已根据服务器公网 IP 自动生成 HTTPS 链接。"),
+        'auto_http': escape_markdown("已根据服务器公网 IP 自动生成 HTTP 链接。"),
+        'guessed_https': escape_markdown("检测到缺少协议，已自动补全为 HTTPS。"),
+    }
+
+    hint = result.get('normalization_hint')
+    if hint in hint_messages:
+        notice += "\n" + hint_messages[hint]
+
+    status_text = build_webapp_status_report(get_configured_webapp_url())
+    reply_text = notice + "\n\n" + status_text
+    bot.reply_to(message, reply_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
+
+
+def create_okpay_order_for_user(user_id: int, amount: float):
+    if amount <= 0:
+        raise ValueError('金额必须为正数')
+
+    response = okpay_client.pay_link(amount)
+
+    if not response or 'data' not in response or not response['data']:
+        error_msg = None
+        if isinstance(response, dict):
+            error_msg = response.get('error') or response.get('msg')
+        raise RuntimeError(error_msg or '创建订单失败')
+
+    order_id = response['data'].get('order_id')
+    pay_url = response['data'].get('pay_url')
+
+    if not order_id or not pay_url:
+        raise RuntimeError('支付服务返回的数据不完整')
+
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        try:
+            c.execute(
+                "INSERT INTO okpay_orders (order_id, user_id, amount, status, timestamp) VALUES (?, ?, ?, ?, ?)",
+                (order_id, user_id, amount, 'pending', int(time.time()))
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    logger.info(f"用户 {user_id} 订单创建成功，订单号: {order_id}")
+    return {'order_id': order_id, 'pay_url': pay_url, 'amount': amount}
 
 def process_sponsor_amount(message):
     user_id = message.from_user.id
@@ -1798,26 +2200,81 @@ def process_sponsor_amount(message):
 
     except (ValueError, TypeError):
         bot.reply_to(message, "⚠️ *{escape_markdown('金额无效')}*\n{escape_markdown('请输入一个有效的数字 (例如: 10 或 10.5)。')}", parse_mode="MarkdownV2")
+    except RuntimeError as e:
+        bot.send_message(user_id, f"❌ 创建订单失败: {escape_markdown(str(e))}", parse_mode="MarkdownV2")
+        logger.error(f"为用户 {user_id} 创建订单失败: {e}")
     except Exception as e:
         logger.exception(f"处理赞助金额时发生错误: {e}")
         bot.reply_to(message, f"❌ {escape_markdown('处理请求时发生错误，请稍后重试。')}", parse_mode="MarkdownV2")
 
 
-@bot.message_handler(commands=['leaderboard'])
-@check_membership
-def handle_leaderboard(message):
+def get_top_sponsors(limit: int = 10):
     with db_lock:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("""
+        c.execute(
+            """
             SELECT s.user_id, s.total_amount_usdt, u.first_name, u.last_name
             FROM sponsors s
             LEFT JOIN users u ON s.user_id = u.user_id
             ORDER BY s.total_amount_usdt DESC
-            LIMIT 10
-        """)
-        top_sponsors = c.fetchall()
+            LIMIT ?
+            """,
+            (limit,)
+        )
+        rows = c.fetchall()
         conn.close()
+
+    sponsors = []
+    for row in rows:
+        display_name = f"{row['first_name'] or ''} {row['last_name'] or ''}".strip()
+        sponsors.append({
+            'user_id': row['user_id'],
+            'total_amount_usdt': row['total_amount_usdt'],
+            'display_name': display_name or None
+        })
+    return sponsors
+
+
+def collect_bot_stats():
+    online_count = get_online_user_count()
+
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total_users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM bot_interactors")
+        interacted_users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM message_history")
+        total_messages = c.fetchone()[0]
+        c.execute("SELECT COUNT(id) FROM username_history")
+        total_username_changes = c.fetchone()[0]
+        c.execute("SELECT COUNT(id) FROM name_history")
+        total_name_changes = c.fetchone()[0]
+        conn.close()
+
+    reports = load_reports()
+    verified_count = len(reports.get('verified', {}))
+    channel_count = len(load_channels())
+    telethon_connected = bool(telethon_loop and client.is_connected())
+
+    return {
+        'online_count': online_count,
+        'total_users': total_users,
+        'interacted_users': interacted_users,
+        'total_messages': total_messages,
+        'identity_changes': total_username_changes + total_name_changes,
+        'verified_reports': verified_count,
+        'monitored_channels': channel_count,
+        'telethon_connected': telethon_connected
+    }
+
+
+@bot.message_handler(commands=['leaderboard'])
+@check_membership
+def handle_leaderboard(message):
+    top_sponsors = get_top_sponsors()
 
     if not top_sponsors:
         text = f"🏆 *{escape_markdown('赞助排行榜')}*\n\n{escape_markdown('目前还没有赞助记录，期待您的支持！')}\n\n{ADVERTISEMENT_TEXT}"
@@ -1903,38 +2360,18 @@ def handle_premium_main_menu(message_or_call):
 @check_membership
 def handle_stats(message):
     update_active_user(message.from_user.id)
-    online_count = get_online_user_count()
-    
-    with db_lock:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users")
-        total_users = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM bot_interactors")
-        interacted_users = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM message_history")
-        total_messages = c.fetchone()[0]
-        c.execute("SELECT COUNT(id) FROM username_history")
-        total_username_changes = c.fetchone()[0]
-        c.execute("SELECT COUNT(id) FROM name_history")
-        total_name_changes = c.fetchone()[0]
-        conn.close()
-
-    reports = load_reports()
-    verified_count = len(reports.get('verified', {}))
-    channel_count = len(load_channels())
-    backend_status = '✅ 在线' if telethon_loop and client.is_connected() else '❌ 离线'
-    
+    stats = collect_bot_stats()
+    backend_status = '✅ 在线' if stats['telethon_connected'] else '❌ 离线'
     stats_text = (
         f"📊 *{escape_markdown('机器人状态概览')}*\n"
         f"*{'─' * 20}*\n"
-        f"🟢 *{escape_markdown('在线用户:')}* `{online_count}` {escape_markdown('人')}\n"
-        f"📡 *{escape_markdown('可达用户:')}* `{interacted_users}` {escape_markdown('人')}\n"
-        f"👥 *{escape_markdown('总收录用户:')}* `{total_users}`\n"
-        f"✉️ *{escape_markdown('总记录消息:')}* `{total_messages}`\n"
-        f"🔄 *{escape_markdown('身份变更:')}* `{total_username_changes + total_name_changes}` {escape_markdown('次')}\n"
-        f"📝 *{escape_markdown('已验证投稿:')}* `{verified_count}` {escape_markdown('条')}\n"
-        f"📺 *{escape_markdown('监控频道数:')}* `{channel_count}` {escape_markdown('个')}\n"
+        f"🟢 *{escape_markdown('在线用户:')}* `{stats['online_count']}` {escape_markdown('人')}\n"
+        f"📡 *{escape_markdown('可达用户:')}* `{stats['interacted_users']}` {escape_markdown('人')}\n"
+        f"👥 *{escape_markdown('总收录用户:')}* `{stats['total_users']}`\n"
+        f"✉️ *{escape_markdown('总记录消息:')}* `{stats['total_messages']}`\n"
+        f"🔄 *{escape_markdown('身份变更:')}* `{stats['identity_changes']}` {escape_markdown('次')}\n"
+        f"📝 *{escape_markdown('已验证投稿:')}* `{stats['verified_reports']}` {escape_markdown('条')}\n"
+        f"📺 *{escape_markdown('监控频道数:')}* `{stats['monitored_channels']}` {escape_markdown('个')}\n"
         f"⚙️ *{escape_markdown('后台引擎:')}* {escape_markdown(backend_status)}\n"
         f"`{escape_for_code(BOT_VERSION)}`\n"
         f"*{'─' * 20}*\n"
@@ -1991,12 +2428,12 @@ def handle_admin_commands(message):
         current_channels = load_channels()
         if command == '/addchannel':
             if any(str(c).lower() == str(target).lower() for c in current_channels):
-                reply_text = f"{escape_markdown('ℹ️ 频道 ')}\`{escape_for_code(str(target))}\`{escape_markdown(' 已存在。')}"
+                reply_text = f"{escape_markdown('ℹ️ 频道 ')}{format_inline_code(str(target))}{escape_markdown(' 已存在。')}"
                 bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
                 return
             current_channels.append(target)
             if save_channels(current_channels):
-                reply_text = f"✅ {escape_markdown('成功添加 ')}\`{escape_for_code(str(target))}\`{escape_markdown(' 到监控列表。')}"
+                reply_text = f"✅ {escape_markdown('成功添加 ')}{format_inline_code(str(target))}{escape_markdown(' 到监控列表。')}"
                 bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
             else:
                 bot.reply_to(message, escape_markdown(f"❌ 添加失败，无法写入文件。"), parse_mode="MarkdownV2")
@@ -2006,12 +2443,12 @@ def handle_admin_commands(message):
             new_channels = [c for c in current_channels if str(c).lower() != str(target).lower()]
             if len(new_channels) < original_len:
                 if save_channels(new_channels):
-                    reply_text = f"✅ {escape_markdown('成功移除 ')}\`{escape_for_code(str(target))}\`{escape_markdown('。')}"
+                    reply_text = f"✅ {escape_markdown('成功移除 ')}{format_inline_code(str(target))}{escape_markdown('。')}"
                     bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
                 else:
                     bot.reply_to(message, escape_markdown(f"❌ 移除失败，无法写入文件。"), parse_mode="MarkdownV2")
             else:
-                reply_text = f"⚠️ {escape_markdown('未在列表中找到 ')}\`{escape_for_code(str(target))}\`{escape_markdown('。')}"
+                reply_text = f"⚠️ {escape_markdown('未在列表中找到 ')}{format_inline_code(str(target))}{escape_markdown('。')}"
                 bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
     
     elif command == '/listchannels':
@@ -2019,7 +2456,7 @@ def handle_admin_commands(message):
         if not current_channels:
             response_text = escape_markdown("ℹ️ 当前没有设置任何监控频道。")
         else:
-            channels_text = "\n".join([f"📺 `{escape_for_code(str(ch))}`" for ch in current_channels])
+            channels_text = "\n".join([f"📺 {format_inline_code(str(ch))}" for ch in current_channels])
             response_text = f"📝 *{escape_markdown('当前监控的频道/群组列表:')}*\n\n{channels_text}"
         bot.reply_to(message, response_text + f"\n\n{ADVERTISEMENT_TEXT}", parse_mode="MarkdownV2")
 
@@ -2043,10 +2480,10 @@ def handle_admin_commands(message):
         if key_to_delete:
             del reports['verified'][key_to_delete]
             save_reports(reports)
-            reply_text = f"✅ {escape_markdown('成功删除关于 ')}\`{escape_for_code(query)}\`{escape_markdown(' 的已验证报告。')}"
+            reply_text = f"✅ {escape_markdown('成功删除关于 ')}{format_inline_code(query)}{escape_markdown(' 的已验证报告。')}"
             bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
         else:
-            reply_text = f"⚠️ {escape_markdown('未在已验证报告中找到 ')}\`{escape_for_code(query)}\`{escape_markdown('。')}"
+            reply_text = f"⚠️ {escape_markdown('未在已验证报告中找到 ')}{format_inline_code(query)}{escape_markdown('。')}"
             bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
 
     elif command == '/broadcast':
@@ -2210,6 +2647,727 @@ def handle_hidden_forward(message):
     )
     bot.reply_to(message, response_text + f"\n\n{ADVERTISEMENT_TEXT}", parse_mode="MarkdownV2")
 
+
+def build_query_report_summary(resolved_id, db_history, verified_info, scam_channel_hits, common_groups,
+                               spoken_in_group_ids, phone_history, bio_history):
+    if isinstance(db_history, sqlite3.Row):
+        db_history = row_to_dict(db_history) or {}
+    summary = {
+        'resolved_id': resolved_id,
+        'risk_source': '官方验证投稿' if verified_info else ('反诈频道曝光' if scam_channel_hits else None),
+        'profile': None,
+        'business': {},
+        'history': [],
+        'scam_hits': [],
+        'common_groups': [],
+        'bio_history': [],
+        'phone_history': [],
+        'has_verified_report': bool(verified_info)
+    }
+
+    if db_history and db_history.get('current_profile'):
+        profile_raw = db_history['current_profile']
+        profile = row_to_dict(profile_raw) or {}
+        display_name = (f"{profile.get('first_name') or ''} {profile.get('last_name') or ''}").strip()
+        active_usernames = []
+        if profile.get('active_usernames_json'):
+            try:
+                active_usernames = json.loads(profile['active_usernames_json'])
+            except Exception:
+                active_usernames = []
+
+        summary['profile'] = {
+            'user_id': db_history.get('user_id', resolved_id),
+            'display_name': display_name or None,
+            'usernames': active_usernames,
+            'phone': profile.get('phone'),
+            'bio': profile.get('bio'),
+            'limited': False
+        }
+
+        business_info = {}
+        business_bio = profile.get('business_bio')
+        if business_bio:
+            business_info['bio'] = business_bio
+
+        if profile.get('business_location_json'):
+            try:
+                loc_data = json.loads(profile['business_location_json'])
+                business_info['location'] = loc_data.get('address')
+            except Exception:
+                pass
+
+        if profile.get('business_work_hours_json'):
+            try:
+                wh_data = json.loads(profile['business_work_hours_json'])
+                periods = []
+                for period in wh_data.get('periods', []):
+                    start_hour, start_minute = divmod(period.get('start_minute', 0), 60)
+                    end_hour, end_minute = divmod(period.get('end_minute', 0), 60)
+                    periods.append(f"{start_hour:02d}:{start_minute:02d}-{end_hour:02d}:{end_minute:02d}")
+                if periods:
+                    business_info['work_hours'] = periods
+                if wh_data.get('timezone_id'):
+                    business_info['timezone'] = wh_data['timezone_id']
+            except Exception:
+                pass
+
+        summary['business'] = business_info
+    else:
+        summary['profile'] = {
+            'user_id': resolved_id,
+            'limited': True
+        }
+        summary['business'] = {}
+
+    profile_history = db_history.get('profile_history', []) if db_history else []
+    for entry in profile_history:
+        entry = row_to_dict(entry) or {}
+        timestamp = entry.get('timestamp')
+        display_time = None
+        if timestamp:
+            try:
+                display_time = datetime.fromtimestamp(timestamp, tz=CHINA_TZ).strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                display_time = None
+        summary['history'].append({
+            'timestamp': int(timestamp) if timestamp else None,
+            'display_time': display_time,
+            'name': entry.get('name'),
+            'username': entry.get('username')
+        })
+
+    for hit in scam_channel_hits or []:
+        if isinstance(hit, dict):
+            summary['scam_hits'].append({
+                'chat_title': hit.get('chat_title'),
+                'link': hit.get('link')
+            })
+
+    groups_map = {}
+    for group in common_groups or []:
+        if not isinstance(group, dict):
+            continue
+        gid = group.get('id')
+        if gid is None:
+            continue
+        usernames = [u for u in group.get('usernames', []) if u]
+        groups_map[gid] = {
+            'id': gid,
+            'title': group.get('title'),
+            'usernames': usernames
+        }
+
+    for chat_id in spoken_in_group_ids or []:
+        if chat_id in groups_map:
+            continue
+        db_info = get_chat_info_from_db(chat_id)
+        if db_info:
+            usernames = [db_info['username']] if db_info.get('username') else []
+            groups_map[chat_id] = {
+                'id': chat_id,
+                'title': db_info.get('title'),
+                'usernames': usernames
+            }
+
+    common_groups_list = list(groups_map.values())
+    summary['common_groups'] = sorted(common_groups_list, key=lambda g: (str(g.get('title') or '')).lower())
+    for group in summary['common_groups']:
+        group['is_private'] = not bool(group.get('usernames'))
+
+    for entry in bio_history or []:
+        if not isinstance(entry, dict):
+            continue
+        timestamp = entry.get('date') or entry.get('timestamp')
+        display_date = None
+        if timestamp:
+            try:
+                display_date = datetime.fromtimestamp(timestamp, tz=CHINA_TZ).strftime('%Y-%m-%d')
+            except Exception:
+                display_date = None
+        summary['bio_history'].append({
+            'timestamp': int(timestamp) if timestamp else None,
+            'display_date': display_date,
+            'bio': entry.get('bio')
+        })
+
+    summary['phone_history'] = [str(phone) for phone in (phone_history or []) if phone]
+
+    return summary
+
+
+def build_query_report_markdown(summary):
+    parts = []
+    risk_source = summary.get('risk_source')
+    if risk_source:
+        parts.append(
+            f"🚨 *{escape_markdown('高风险警报')}* 🚨\n*{escape_markdown('风险来源:')}* {escape_markdown(risk_source)}"
+        )
+
+    profile = summary.get('profile') or {}
+    if profile.get('limited'):
+        header = f"👤 *{escape_markdown('用户资料 (信息受限)')}*"
+        id_line = f"› *ID:* `{summary['resolved_id']}`"
+        note_line = f"_{escape_markdown('注意：无法获取此用户的实时详细资料，可能因其隐私设置或已注销。')}_"
+        parts.append(f"{header}\n{id_line}\n{note_line}")
+    else:
+        user_summary = [f"👤 *{escape_markdown('用户资料')}*"]
+        user_summary.append(f"› *ID:* `{summary['resolved_id']}`")
+        if profile.get('display_name'):
+            user_summary.append(f"› *Name:* {escape_markdown(profile['display_name'])}")
+        usernames = profile.get('usernames') or []
+        if usernames:
+            user_summary.append(
+                f"› *Username:* {', '.join([f'@{escape_markdown(u)}' for u in usernames])}"
+            )
+        if profile.get('phone'):
+            user_summary.append(f"› *Phone:* `{escape_for_code(profile['phone'])}`")
+        if profile.get('bio'):
+            user_summary.append(f"› *Bio:* {escape_markdown(profile['bio'])}")
+        parts.append("\n".join(user_summary))
+
+        business = summary.get('business') or {}
+        business_parts = []
+        if business.get('bio'):
+            business_parts.append(f"› *简介:* {escape_markdown(business['bio'])}")
+        if business.get('location'):
+            business_parts.append(f"› *位置:* {escape_markdown(business['location'])}")
+        if business.get('work_hours'):
+            hours_text = ', '.join([escape_markdown(h) for h in business['work_hours']])
+            if business.get('timezone'):
+                hours_text += f" ({escape_markdown(business['timezone'])})"
+            business_parts.append(f"› *时间:* {hours_text}")
+        if business_parts:
+            parts.append(f"🏢 *{escape_markdown('营业信息')}*\n" + "\n".join(business_parts))
+
+    scam_hits = summary.get('scam_hits') or []
+    if scam_hits:
+        count_text = escape_markdown(f"({len(scam_hits)} 条)")
+        risk_header = f"🔍 *{escape_markdown('风险记录')} {count_text}*"
+        risk_parts = [risk_header]
+        for hit in scam_hits:
+            title = _sanitize_for_link_text(hit.get('chat_title') or '未知频道')
+            link = hit.get('link') or ''
+            risk_parts.append(f"› [{escape_markdown(title)}]({link})")
+        parts.append("\n".join(risk_parts))
+
+    history = summary.get('history') or []
+    if len(history) > 1:
+        history_count = escape_markdown(f"({len(history)} 条)")
+        history_header = f"📜 *{escape_markdown('历史变动')} {history_count}*"
+        event_blocks = []
+        for event in history:
+            formatted_time = escape_for_code(event.get('display_time') or '未知')
+            name_str = escape_for_code(event.get('name') or '无')
+            username = event.get('username')
+            username_part = f"@{username}" if username else '无'
+            username_str = escape_markdown(username_part)
+            event_blocks.append(f"`{formatted_time}`\n › N: `{name_str}`\n › U: {username_str}")
+        parts.append(history_header + "\n" + "\n\n".join(event_blocks))
+
+    common_groups = summary.get('common_groups') or []
+    if common_groups:
+        group_count = escape_markdown(f"({len(common_groups)} 个)")
+        group_header = f"👥 *{escape_markdown('共同群组')} {group_count}*"
+        group_lines = []
+        for group in common_groups:
+            usernames = group.get('usernames') or []
+            if usernames:
+                username_text = " ".join([f"@{escape_markdown(u)}" for u in usernames])
+            else:
+                username_text = escape_markdown('[私密]')
+            title = escape_markdown(group.get('title') or f"群组ID: {group.get('id')}")
+            group_lines.append(f"› {username_text} - {title}")
+        parts.append(group_header + "\n" + "\n".join(group_lines))
+
+    bio_history = summary.get('bio_history') or []
+    if bio_history:
+        bio_count = escape_markdown(f"({len(bio_history)} 条)")
+        bio_header = f"📝 *Bio {escape_markdown('历史')} {bio_count}*"
+        lines = []
+        for entry in bio_history:
+            date_str = escape_for_code(entry.get('display_date') or '未知')
+            bio_text = escape_for_code((entry.get('bio') or '').strip() or '空')
+            lines.append(f"› `{date_str}`\n  `{bio_text}`")
+        parts.append(bio_header + "\n" + "\n\n".join(lines))
+
+    phone_history = summary.get('phone_history') or []
+    if phone_history:
+        phone_count = escape_markdown(f"({len(phone_history)} 个)")
+        phone_header = f"📱 *{escape_markdown('绑定号码')} {phone_count}*"
+        phone_lines = [f"› `{escape_for_code(phone)}`" for phone in phone_history]
+        parts.append(phone_header + "\n" + "\n".join(phone_lines))
+
+    return "\n\n".join(filter(None, parts))
+
+
+def build_query_report_html(summary):
+    escape = html.escape
+    sections = ["<div class=\"report\">"]
+
+    risk_source = summary.get('risk_source')
+    if risk_source:
+        sections.append(
+            f"<section class=\"block risk\"><h3>高风险警报</h3><p>风险来源：{escape(risk_source)}</p></section>"
+        )
+
+    profile = summary.get('profile') or {}
+    if profile.get('limited'):
+        sections.append(
+            f"<section class=\"block\"><h3>用户资料 (信息受限)</h3>"
+            f"<p><strong>ID：</strong>{escape(str(summary['resolved_id']))}</p>"
+            "<p class=\"muted\">注意：无法获取此用户的实时详细资料，可能因其隐私设置或已注销。</p></section>"
+        )
+    else:
+        profile_lines = [
+            f"<p><strong>ID：</strong>{escape(str(summary['resolved_id']))}</p>"
+        ]
+        if profile.get('display_name'):
+            profile_lines.append(f"<p><strong>名称：</strong>{escape(profile['display_name'])}</p>")
+        usernames = profile.get('usernames') or []
+        if usernames:
+            profile_lines.append(
+                f"<p><strong>用户名：</strong>{'、'.join([escape('@' + u) for u in usernames])}</p>"
+            )
+        if profile.get('phone'):
+            profile_lines.append(f"<p><strong>电话：</strong>{escape(profile['phone'])}</p>")
+        if profile.get('bio'):
+            profile_lines.append(f"<p><strong>签名：</strong>{escape(profile['bio'])}</p>")
+
+        sections.append(
+            "<section class=\"block\"><h3>用户资料</h3>" + "".join(profile_lines) + "</section>"
+        )
+
+        business = summary.get('business') or {}
+        business_lines = []
+        if business.get('bio'):
+            business_lines.append(f"<p><strong>营业简介：</strong>{escape(business['bio'])}</p>")
+        if business.get('location'):
+            business_lines.append(f"<p><strong>营业地址：</strong>{escape(business['location'])}</p>")
+        if business.get('work_hours'):
+            hours_text = '、'.join([escape(h) for h in business['work_hours']])
+            if business.get('timezone'):
+                hours_text += f"（{escape(business['timezone'])}）"
+            business_lines.append(f"<p><strong>营业时间：</strong>{hours_text}</p>")
+        if business_lines:
+            sections.append("<section class=\"block\"><h3>营业信息</h3>" + "".join(business_lines) + "</section>")
+
+    scam_hits = summary.get('scam_hits') or []
+    if scam_hits:
+        hit_items = []
+        for hit in scam_hits:
+            title = escape(hit.get('chat_title') or '未知频道')
+            link = hit.get('link') or '#'
+            hit_items.append(f"<li><a href=\"{escape(link)}\" target=\"_blank\">{title}</a></li>")
+        sections.append(
+            "<section class=\"block\"><h3>风险记录</h3><ul>" + "".join(hit_items) + "</ul></section>"
+        )
+
+    history = summary.get('history') or []
+    if history:
+        rows = []
+        for event in history:
+            time_label = escape(event.get('display_time') or '未知')
+            name_label = escape(event.get('name') or '无')
+            username = event.get('username')
+            username_label = escape('@' + username) if username else '无'
+            rows.append(
+                f"<tr><td>{time_label}</td><td>{name_label}</td><td>{username_label}</td></tr>"
+            )
+        sections.append(
+            "<section class=\"block\"><h3>历史变动</h3>"
+            "<table><thead><tr><th>时间</th><th>名称</th><th>用户名</th></tr></thead><tbody>"
+            + "".join(rows) + "</tbody></table></section>"
+        )
+
+    common_groups = summary.get('common_groups') or []
+    if common_groups:
+        group_items = []
+        for group in common_groups:
+            usernames = group.get('usernames') or []
+            if usernames:
+                username_text = '、'.join([escape('@' + u) for u in usernames])
+            else:
+                username_text = '私密'
+            title = escape(group.get('title') or f"群组ID: {group.get('id')}")
+            group_items.append(f"<li><span>{username_text}</span> - {title}</li>")
+        sections.append(
+            "<section class=\"block\"><h3>共同群组</h3><ul>" + "".join(group_items) + "</ul></section>"
+        )
+
+    bio_history = summary.get('bio_history') or []
+    if bio_history:
+        bio_items = []
+        for entry in bio_history:
+            date_label = escape(entry.get('display_date') or '未知')
+            bio_label = escape((entry.get('bio') or '').strip() or '空')
+            bio_items.append(f"<li><strong>{date_label}</strong><br>{bio_label}</li>")
+        sections.append(
+            "<section class=\"block\"><h3>Bio 历史</h3><ul>" + "".join(bio_items) + "</ul></section>"
+        )
+
+    phone_history = summary.get('phone_history') or []
+    if phone_history:
+        phone_items = [f"<li>{escape(phone)}</li>" for phone in phone_history]
+        sections.append(
+            "<section class=\"block\"><h3>绑定号码</h3><ul>" + "".join(phone_items) + "</ul></section>"
+        )
+
+    sections.append(f"<section class=\"block ad-wrapper\">{get_advertisement_html()}</section>")
+    sections.append("</div>")
+    return "".join(sections)
+
+
+def build_webapp_html():
+    ad_html = get_advertisement_html()
+    title = "猎诈卫士 · 安全情报控制台"
+    version = html.escape(BOT_VERSION)
+    current_year = datetime.now(CHINA_TZ).year
+    return f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>
+:root {{ color-scheme: light dark; }}
+body {{ margin:0; font-family:'Segoe UI','PingFang SC',sans-serif; background:#0f172a; color:#e2e8f0; }}
+a {{ color:#38bdf8; text-decoration:none; }}
+a:hover {{ text-decoration:underline; }}
+.app {{ max-width:960px; margin:0 auto; padding:24px 16px 48px; }}
+header {{ text-align:center; margin-bottom:32px; }}
+.hero-title {{ font-size:2.2rem; margin-bottom:8px; font-weight:700; }}
+.tagline {{ color:#94a3b8; margin:0; }}
+.sections {{ display:grid; gap:24px; }}
+.card {{ background:rgba(15,23,42,0.75); border:1px solid rgba(148,163,184,0.18); border-radius:18px; padding:20px; box-shadow:0 24px 60px rgba(15,23,42,0.55); backdrop-filter:blur(18px); }}
+.card h2 {{ margin-top:0; font-size:1.3rem; font-weight:600; }}
+.card p {{ margin-bottom:12px; line-height:1.6; }}
+form {{ display:flex; flex-direction:column; gap:12px; }}
+input {{ padding:12px 16px; border-radius:14px; border:1px solid rgba(148,163,184,0.25); background:rgba(15,23,42,0.35); color:inherit; font-size:1rem; box-shadow:inset 0 1px 0 rgba(255,255,255,0.05); }}
+button {{ padding:12px 16px; border-radius:14px; border:none; background:linear-gradient(135deg,#38bdf8,#6366f1); color:#0f172a; font-weight:600; font-size:1rem; cursor:pointer; transition:transform 0.2s ease, box-shadow 0.2s ease; }}
+button:hover {{ transform:translateY(-1px); box-shadow:0 14px 30px rgba(99,102,241,0.45); }}
+.notice {{ margin-top:12px; padding:12px 16px; border-radius:14px; background:rgba(30,41,59,0.75); border:1px solid rgba(248,113,113,0.35); color:#fca5a5; display:none; }}
+.notice.success {{ border-color:rgba(74,222,128,0.4); color:#86efac; }}
+#queryResult {{ margin-top:18px; display:none; }}
+.table {{ width:100%; border-collapse:collapse; margin-top:12px; font-size:0.95rem; }}
+.table th, .table td {{ padding:10px 12px; border-bottom:1px solid rgba(148,163,184,0.15); text-align:left; }}
+.list {{ list-style:none; padding-left:0; margin:0; }}
+.list li {{ margin-bottom:8px; line-height:1.6; }}
+.badge {{ display:inline-block; padding:4px 10px; border-radius:999px; background:rgba(56,189,248,0.15); color:#bae6fd; font-size:0.75rem; margin-right:8px; }}
+.ad-section {{ margin-top:32px; text-align:center; }}
+footer {{ margin-top:36px; text-align:center; color:#94a3b8; font-size:0.9rem; }}
+@media (min-width:768px) {{ .sections {{ grid-template-columns:repeat(2, minmax(0, 1fr)); }} }}
+</style>
+</head>
+<body>
+<div class="app">
+<header class="card">
+    <h1 class="hero-title">{html.escape(title)}</h1>
+    <p class="tagline">实时掌握诈骗风险情报，支持 Telegram 与网页双端体验。</p>
+    <p class="tagline">当前版本：{version}</p>
+</header>
+<div class="sections">
+    <section class="card">
+        <h2>快速查询</h2>
+        <p>输入 Telegram 用户名、ID 或粘贴目标信息，立即获取风险情报报告。</p>
+        <form id="queryForm">
+            <input id="queryInput" placeholder="例如：@username 或 123456789" required />
+            <button type="submit">开始查询</button>
+        </form>
+        <div id="queryNotice" class="notice"></div>
+        <div id="queryResult" class="card"></div>
+    </section>
+    <section class="card" id="statsCard">
+        <h2>运行状态</h2>
+        <div id="statsContent">正在加载统计数据...</div>
+    </section>
+    <section class="card" id="leaderboardCard">
+        <h2>赞助排行榜</h2>
+        <ol id="leaderboardList" class="list"></ol>
+    </section>
+    <section class="card">
+        <h2>在线赞助</h2>
+        <p>填写您的 Telegram 数字 ID 与赞助金额 (USDT)，即可生成 OKPay 支付链接。</p>
+        <form id="sponsorForm">
+            <input id="sponsorId" placeholder="Telegram 数字 ID" required />
+            <input id="sponsorAmount" placeholder="赞助金额 (USDT)" required />
+            <button type="submit">创建赞助订单</button>
+        </form>
+        <div id="sponsorNotice" class="notice"></div>
+    </section>
+</div>
+<div class="card">
+    <h2>使用提示</h2>
+    <ul class="list">
+        <li>📥 在 Telegram 内发送 <code>/start</code> 或 <code>/cxzbf</code> 依旧可使用机器人完整功能。</li>
+        <li>🛡️ 网页版仅提供安全浏览与下单体验，敏感数据仍由机器人端安全处理。</li>
+        <li>💬 如需人工协助，请通过下方联系方式联系我们。</li>
+    </ul>
+</div>
+<div class="ad-section">{ad_html}</div>
+<footer>© {current_year} 猎诈卫士 · 守护每一次安全对话。</footer>
+</div>
+<script>
+const queryForm = document.getElementById('queryForm');
+const queryInput = document.getElementById('queryInput');
+const queryNotice = document.getElementById('queryNotice');
+const queryResult = document.getElementById('queryResult');
+const statsContent = document.getElementById('statsContent');
+const leaderboardList = document.getElementById('leaderboardList');
+const sponsorForm = document.getElementById('sponsorForm');
+const sponsorNotice = document.getElementById('sponsorNotice');
+
+function showNotice(element, message, isSuccess = false) {{
+    element.textContent = message;
+    element.className = isSuccess ? 'notice success' : 'notice';
+    element.style.display = 'block';
+}}
+
+queryForm.addEventListener('submit', async (event) => {{
+    event.preventDefault();
+    const keyword = queryInput.value.trim();
+    if (!keyword) return;
+    showNotice(queryNotice, '正在检索，请稍候...');
+    queryResult.style.display = 'none';
+    try {{
+        const response = await fetch('/api/query', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ query: keyword }})
+        }});
+        const data = await response.json();
+        if (!response.ok) {{
+            throw new Error(data.message || '查询失败');
+        }}
+        if (data.status === 'success') {{
+            queryResult.innerHTML = data.report_html;
+            queryResult.style.display = 'block';
+            showNotice(queryNotice, '查询成功，以下为详细报告。', true);
+        }} else if (data.status === 'no_data') {{
+            queryResult.style.display = 'none';
+            showNotice(queryNotice, data.message || '已识别用户，但暂无相关记录。');
+        }} else if (data.status === 'partial') {{
+            const items = (data.partial_hits || []).map(hit => {{
+                const link = hit.link ? `<a href="${{hit.link}}" target="_blank">${{hit.chat_title || '未知频道'}}</a>` : (hit.chat_title || '未知频道');
+                return `<li>${{link}}</li>`;
+            }}).join('');
+            queryResult.innerHTML = `<div class="card"><h3>部分匹配结果</h3><p>未能直接识别该用户，以下为监控频道中的相关提及：</p><ul class="list">${{items}}</ul></div>`;
+            queryResult.style.display = 'block';
+            showNotice(queryNotice, '已找到相关线索，请确认是否为同一用户。');
+        }} else if (data.status === 'not_found') {{
+            queryResult.style.display = 'none';
+            showNotice(queryNotice, data.message || '未找到任何相关记录。');
+        }} else if (data.status === 'unavailable') {{
+            queryResult.style.display = 'none';
+            showNotice(queryNotice, data.message || '后台服务暂不可用，请稍后再试。');
+        }} else {{
+            queryResult.style.display = 'none';
+            showNotice(queryNotice, data.message || '查询失败，请稍后重试。');
+        }}
+    }} catch (error) {{
+        queryResult.style.display = 'none';
+        showNotice(queryNotice, error.message || '查询失败，请稍后重试。');
+    }}
+}});
+
+async function loadStats() {{
+    try {{
+        const response = await fetch('/api/stats');
+        const data = await response.json();
+        if (response.ok && data.status === 'success') {{
+            const s = data.data;
+            const engine = s.telethon_connected ? '✅ 在线' : '❌ 离线';
+            statsContent.innerHTML = `
+                <ul class="list">
+                    <li>🟢 在线用户：<strong>${{s.online_count}}</strong></li>
+                    <li>📡 可达用户：<strong>${{s.interacted_users}}</strong></li>
+                    <li>👥 总收录用户：<strong>${{s.total_users}}</strong></li>
+                    <li>✉️ 累计消息：<strong>${{s.total_messages}}</strong></li>
+                    <li>🔄 身份变更记录：<strong>${{s.identity_changes}}</strong></li>
+                    <li>📝 已验证投稿：<strong>${{s.verified_reports}}</strong></li>
+                    <li>📺 监控频道数：<strong>${{s.monitored_channels}}</strong></li>
+                    <li>⚙️ 后台状态：<strong>${{engine}}</strong></li>
+                </ul>`;
+        }} else {{
+            statsContent.textContent = data.message || '暂时无法获取统计数据。';
+        }}
+    }} catch (error) {{
+        statsContent.textContent = '统计数据加载失败，请稍后重试。';
+    }}
+}}
+
+async function loadLeaderboard() {{
+    try {{
+        const response = await fetch('/api/leaderboard');
+        const data = await response.json();
+        if (response.ok && data.status === 'success') {{
+            if (!data.sponsors || !data.sponsors.length) {{
+                leaderboardList.innerHTML = '<li>暂无赞助记录，期待您的支持！</li>';
+                return;
+            }}
+            leaderboardList.innerHTML = data.sponsors.map((item, index) => {{
+                const rankIcon = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `${{index + 1}}.`;
+                const name = item.display_name || `用户 ${{item.user_id}}`;
+                return `<li>${{rankIcon}} ${name} <span class="badge">${{item.total_amount_usdt.toFixed(2)}} USDT</span></li>`;
+            }}).join('');
+        }} else {{
+            leaderboardList.innerHTML = '<li>赞助数据暂不可用。</li>';
+        }}
+    }} catch (error) {{
+        leaderboardList.innerHTML = '<li>排行榜加载失败。</li>';
+    }}
+}}
+
+sponsorForm.addEventListener('submit', async (event) => {{
+    event.preventDefault();
+    const idValue = document.getElementById('sponsorId').value.trim();
+    const amountValue = document.getElementById('sponsorAmount').value.trim();
+    showNotice(sponsorNotice, '正在创建赞助订单，请稍候...');
+    try {{
+        const response = await fetch('/api/sponsor/order', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ telegram_id: idValue, amount: amountValue }})
+        }});
+        const data = await response.json();
+        if (response.ok && data.status === 'success') {{
+            sponsorNotice.innerHTML = `✅ 订单创建成功：<strong>${{data.order_id}}</strong><br>请在 <a href="${{data.pay_url}}" target="_blank">OKPay 页面</a> 完成支付。`;
+            sponsorNotice.className = 'notice success';
+        }} else {{
+            sponsorNotice.className = 'notice';
+            sponsorNotice.textContent = data.message || '赞助订单创建失败，请稍后再试。';
+        }}
+    }} catch (error) {{
+        sponsorNotice.className = 'notice';
+        sponsorNotice.textContent = '赞助订单创建失败，请稍后重试。';
+    }}
+}});
+
+loadStats();
+loadLeaderboard();
+</script>
+</body>
+</html>
+"""
+
+
+def collect_query_insights(query: str):
+    try:
+        query_cleaned = query.strip().lstrip('@')
+        resolved_id = None
+        user_to_sync = None
+
+        if query_cleaned.isdigit():
+            try:
+                resolved_id = int(query_cleaned)
+                print(f"ℹ️ [ID-Resolve] Query is numeric. Tentative ID: {resolved_id}")
+            except (ValueError, TypeError):
+                resolved_id = None
+
+        try:
+            entity_query = int(query_cleaned) if query_cleaned.isdigit() else query_cleaned
+            future = asyncio.run_coroutine_threadsafe(client.get_entity(entity_query), telethon_loop)
+            live_user = future.result(timeout=CONFIG["TELETHON_TIMEOUT"])
+            if live_user and isinstance(live_user, User) and not live_user.bot:
+                user_to_sync = live_user
+                resolved_id = live_user.id
+                print(f"✅ [ID-Resolve] API resolved '{query}' to ID: {resolved_id}")
+        except (FuturesTimeoutError, TelethonTimeoutError):
+            print(f"⚠️ [ID-Resolve] API lookup for '{query}' timed out.")
+        except (ValueError, TypeError, UsernameInvalidError, PeerIdInvalidError):
+            print(f"ℹ️ [ID-Resolve] API could not find user '{query}'.")
+        except Exception as e:
+            print(f"💥 [ID-Resolve] Unexpected error for '{query}': {e}")
+
+        if not resolved_id:
+            resolved_id = _resolve_historic_query_to_id(query)
+            if resolved_id:
+                print(f"✅ [ID-Resolve] Found ID {resolved_id} for '{query}' in historical DB.")
+
+        if resolved_id:
+            try:
+                if not user_to_sync:
+                    entity_future = asyncio.run_coroutine_threadsafe(client.get_entity(resolved_id), telethon_loop)
+                    user_to_sync = entity_future.result(timeout=CONFIG["TELETHON_TIMEOUT"])
+                if user_to_sync and isinstance(user_to_sync, User):
+                    update_future = asyncio.run_coroutine_threadsafe(update_user_in_db(user_to_sync), telethon_loop)
+                    update_future.result(timeout=CONFIG["TELETHON_TIMEOUT"])
+                    print(f"✅ [Sync-Complete] DB synchronized for user {resolved_id}.")
+            except Exception as e:
+                print(f"⚠️ [Sync-Error] Sync failed for user {resolved_id}: {e}. Report will use existing/scanned data.")
+
+            scam_channel_hits = []
+            try:
+                search_future = asyncio.run_coroutine_threadsafe(
+                    search_monitored_channels_for_user(user_id=resolved_id), telethon_loop
+                )
+                scam_channel_hits = search_future.result(timeout=CONFIG["SCAM_CHANNEL_SEARCH_TIMEOUT"])
+            except Exception as e:
+                print(f"💥 [Scam-Scan] Error searching channels for user {resolved_id}: {type(e).__name__}")
+
+            common_groups = []
+            try:
+                groups_future = asyncio.run_coroutine_threadsafe(
+                    get_common_groups_with_user(resolved_id), telethon_loop
+                )
+                common_groups = groups_future.result(timeout=CONFIG["COMMON_GROUPS_TIMEOUT"])
+            except Exception as e:
+                print(f"💥 [Common-Groups] Error getting common groups for user {resolved_id}: {type(e).__name__}")
+
+            db_history = query_user_history_from_db(resolved_id)
+            phone_history = query_phone_history_from_db(resolved_id)
+            bio_history = query_bio_history_from_db(resolved_id)
+            spoken_in_group_ids = query_spoken_groups_from_db(resolved_id)
+            reports = load_reports()
+            verified_report = reports.get('verified', {}).get(str(resolved_id))
+
+            if db_history or scam_channel_hits or verified_report:
+                summary = build_query_report_summary(
+                    resolved_id, db_history, verified_report, scam_channel_hits,
+                    common_groups, spoken_in_group_ids, phone_history, bio_history
+                )
+                report_markdown = build_query_report_markdown(summary)
+                return {
+                    'status': 'full',
+                    'resolved_id': resolved_id,
+                    'summary': summary,
+                    'report_markdown': report_markdown,
+                    'verified_info': verified_report
+                }
+
+            return {
+                'status': 'resolved_no_data',
+                'resolved_id': resolved_id
+            }
+
+        partial_hits = []
+        try:
+            search_future = asyncio.run_coroutine_threadsafe(
+                search_monitored_channels_for_user(raw_query=query), telethon_loop
+            )
+            partial_hits = search_future.result(timeout=CONFIG["SCAM_CHANNEL_SEARCH_TIMEOUT"])
+        except Exception as e:
+            print(f"💥 [Fallback-Scan] Channel search failed: {e}")
+
+        sanitized_hits = [
+            {'chat_title': hit.get('chat_title'), 'link': hit.get('link')}
+            for hit in (partial_hits or []) if isinstance(hit, dict)
+        ]
+        if sanitized_hits:
+            return {'status': 'partial_hits', 'partial_hits': sanitized_hits}
+
+        return {'status': 'not_found'}
+
+    except Exception as e:
+        traceback.print_exc()
+        return {
+            'status': 'error',
+            'error': str(e),
+            'error_type': type(e).__name__
+        }
+
+
+
 def trigger_query_flow(message, query):
     update_active_user(message.from_user.id)
 
@@ -2221,278 +3379,142 @@ def trigger_query_flow(message, query):
     try:
         should_reply = not (message.text and message.text.startswith('/start bizChat'))
         reply_params = ReplyParameters(message_id=message.message_id, allow_sending_without_reply=True) if should_reply else None
-        waiting_message = bot.send_message(message.chat.id, escape_markdown("⏳ 正在数据库中检索并同步最新资料... ⚡️"), reply_parameters=reply_params, parse_mode="MarkdownV2")
+        waiting_message = bot.send_message(
+            message.chat.id,
+            escape_markdown("⏳ 正在数据库中检索并同步最新资料... ⚡️"),
+            reply_parameters=reply_params,
+            parse_mode="MarkdownV2"
+        )
     except Exception as e:
         print(f"⚠️ 发送等待消息失败: {e}")
 
     def perform_query_and_send_results():
-        try:
-            resolved_id = None
-            user_to_sync = None
-            query_cleaned = query.strip().lstrip('@')
-            
-            # --- ID Resolution ---
-            if query_cleaned.isdigit():
-                try:
-                    resolved_id = int(query_cleaned)
-                    print(f"ℹ️ [ID-Resolve] Query is numeric. Tentative ID: {resolved_id}")
-                except (ValueError, TypeError):
-                    resolved_id = None
-            
+        result = collect_query_insights(query)
+
+        if waiting_message:
             try:
-                entity_query = int(query_cleaned) if query_cleaned.isdigit() else query_cleaned
-                future = asyncio.run_coroutine_threadsafe(client.get_entity(entity_query), telethon_loop)
-                live_user = future.result(timeout=CONFIG["TELETHON_TIMEOUT"])
-                if live_user and isinstance(live_user, User) and not live_user.bot:
-                    user_to_sync = live_user
-                    resolved_id = live_user.id
-                    print(f"✅ [ID-Resolve] API resolved '{query}' to ID: {resolved_id}")
-            except (FuturesTimeoutError, TelethonTimeoutError):
-                print(f"⚠️ [ID-Resolve] API lookup for '{query}' timed out.")
-            except (ValueError, TypeError, UsernameInvalidError, PeerIdInvalidError):
-                print(f"ℹ️ [ID-Resolve] API could not find user '{query}'.")
-            except Exception as e:
-                print(f"💥 [ID-Resolve] Unexpected error for '{query}': {e}")
+                bot.delete_message(waiting_message.chat.id, waiting_message.message_id)
+            except Exception:
+                pass
 
-            if not resolved_id:
-                resolved_id = _resolve_historic_query_to_id(query)
-                if resolved_id:
-                    print(f"✅ [ID-Resolve] Found ID {resolved_id} for '{query}' in historical DB.")
+        status = result.get('status')
 
-            # --- Main Logic Branch: If an ID was found ---
-            if resolved_id:
-                print(f"✅ [Query-Start] Proceeding with User ID: {resolved_id}. Attempting sync...")
-                try:
-                    if not user_to_sync:
-                        entity_future = asyncio.run_coroutine_threadsafe(client.get_entity(resolved_id), telethon_loop)
-                        user_to_sync = entity_future.result(timeout=CONFIG["TELETHON_TIMEOUT"])
-                    if user_to_sync and isinstance(user_to_sync, User):
-                        update_future = asyncio.run_coroutine_threadsafe(update_user_in_db(user_to_sync), telethon_loop)
-                        update_future.result(timeout=CONFIG["TELETHON_TIMEOUT"])
-                        print(f"✅ [Sync-Complete] DB synchronized for user {resolved_id}.")
-                except Exception as e:
-                    print(f"⚠️ [Sync-Error] Sync failed for user {resolved_id}: {e}. Report will use existing/scanned data.")
-                
-                # --- Always Gather All Available Data ---
-                scam_channel_hits = []
-                try:
-                    search_future = asyncio.run_coroutine_threadsafe(search_monitored_channels_for_user(user_id=resolved_id), telethon_loop)
-                    scam_channel_hits = search_future.result(timeout=CONFIG["SCAM_CHANNEL_SEARCH_TIMEOUT"])
-                except Exception as e:
-                    print(f"💥 [Scam-Scan] Error searching channels for user {resolved_id}: {type(e).__name__}")
-                
-                common_groups = []
-                try:
-                    groups_future = asyncio.run_coroutine_threadsafe(get_common_groups_with_user(resolved_id), telethon_loop)
-                    common_groups = groups_future.result(timeout=CONFIG["COMMON_GROUPS_TIMEOUT"])
-                except Exception as e:
-                    print(f"💥 [Common-Groups] Error getting common groups for user {resolved_id}: {type(e).__name__}")
+        if status == 'full':
+            send_query_result(
+                message=message,
+                resolved_id=result['resolved_id'],
+                report_markdown=result['report_markdown'],
+                verified_info=result.get('verified_info')
+            )
+            return
 
-                db_history = query_user_history_from_db(resolved_id)
-                phone_history = query_phone_history_from_db(resolved_id)
-                bio_history = query_bio_history_from_db(resolved_id)
-                spoken_in_group_ids = query_spoken_groups_from_db(resolved_id)
-                reports = load_reports()
-                verified_report = reports.get('verified', {}).get(str(resolved_id))
+        if status == 'resolved_no_data':
+            reply_text = (
+                f"📭 {escape_markdown('已识别用户ID ')}{format_inline_code(str(result['resolved_id']))}"
+                f"{escape_markdown('，但未在其历史记录、官方投稿或监控频道中发现任何相关信息。')}"
+            )
+            bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
+            return
 
-                if waiting_message:
-                    try: bot.delete_message(waiting_message.chat.id, waiting_message.message_id)
-                    except Exception: pass
 
-                # --- Decision Point: Is there anything to report? ---
-                if db_history or scam_channel_hits or verified_report:
-                    send_query_result(
-                        message=message, query=query, resolved_id=resolved_id, db_history=db_history,
-                        verified_info=verified_report, scam_channel_hits=scam_channel_hits,
-                        common_groups=common_groups, spoken_in_group_ids=spoken_in_group_ids,
-                        phone_history=phone_history, bio_history=bio_history
-                    )
-                else:
-                    reply_text = f"📭 {escape_markdown('已识别用户ID ')}\`{escape_for_code(str(resolved_id))}\`{escape_markdown('，但未在其历史记录、官方投稿或监控频道中发现任何相关信息。')}"
-                    bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
-                return
+        if status == 'partial_hits':
+            partial_hits = result.get('partial_hits', [])
+            header = (
+                f"⚠️ *{escape_markdown('部分匹配结果')}*\n"
+                f"{escape_markdown('无法直接识别用户 ')}{format_inline_code(query)}"
+                f"{escape_markdown('，可能因为对方隐私设置严格或已注销。')}\n\n"
+                f"{escape_markdown('但是，我们在监控频道中找到了包含此ID或用户名的提及记录:')}"
+            )
+            partial_count = escape_markdown(f"({len(partial_hits)} 条)")
+            risk_header = f"🔍 *{escape_markdown('风险记录')} {partial_count}*"
+            risk_parts = [risk_header]
+            for hit in partial_hits:
+                title = _sanitize_for_link_text(hit.get('chat_title') or '未知频道')
+                link = hit.get('link') or ''
+                risk_parts.append(f"› [{escape_markdown(title)}]({link})")
+            final_text = header + "\n\n" + "\n".join(risk_parts) + f"\n\n{ADVERTISEMENT_TEXT}"
+            bot.reply_to(message, final_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
+            return
 
-            # --- Fallback Branch: If NO ID was found ---
-            print(f"ℹ️ [Fallback-Scan] Could not resolve '{query}' to an ID. Searching raw text in channels.")
-            
-            partial_hits = []
-            try:
-                search_future = asyncio.run_coroutine_threadsafe(search_monitored_channels_for_user(raw_query=query), telethon_loop)
-                partial_hits = search_future.result(timeout=CONFIG["SCAM_CHANNEL_SEARCH_TIMEOUT"])
-            except Exception as e:
-                print(f"💥 [Fallback-Scan] Channel search failed: {e}")
 
-            if waiting_message:
-                try: bot.delete_message(waiting_message.chat.id, waiting_message.message_id)
-                except Exception: pass
+        if status == 'not_found':
+            reply_text = (
+                f"📭 {escape_markdown('未在数据库中找到与 ')}{format_inline_code(query)}"
+                f"{escape_markdown(' 相关的任何用户记录，各监控频道中也无相关内容。此用户可能不存在或与诈骗无关。')}"
+            )
+            bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
+            return
 
-            if partial_hits:
-                header = f"⚠️ *{escape_markdown('部分匹配结果')}*\n\n{escape_markdown('无法直接识别用户 ')}\`{escape_for_code(query)}\`{escape_markdown('，可能因为对方隐私设置严格或已注销。')}\n\n{escape_markdown('但是，我们在监控频道中找到了包含此ID或用户名的提及记录:')}"
-                risk_header = f"🔍 *{escape_markdown('风险记录')} \\({len(partial_hits)} {escape_markdown('条')}\\)*"
-                risk_parts = [risk_header] + [f"› [{escape_markdown(_sanitize_for_link_text(hit['chat_title']))}]({hit['link']})" for hit in partial_hits]
-                final_text = header + "\n\n" + "\n".join(risk_parts) + f"\n\n{ADVERTISEMENT_TEXT}"
-                bot.reply_to(message, final_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
-            else:
-                reply_text = f"📭 {escape_markdown('未在数据库中找到与 ')}\`{escape_for_code(query)}\`{escape_markdown(' 相关的任何用户记录，各监控频道中也无相关内容。此用户可能不存在或与诈骗无关。')}"
-                bot.reply_to(message, reply_text, parse_mode="MarkdownV2")
+        error_type = result.get('error_type') or 'Error'
+        error_msg = result.get('error') or '未知错误'
+        error_text = (
+            f"❌ {escape_markdown('查询失败，请稍后重试或联系管理员。')}"
+            f"\n`{escape_for_code(error_type)}`: {escape_markdown(error_msg)}"
+        )
+        bot.reply_to(message, error_text, parse_mode="MarkdownV2")
 
-        except Exception as e:
-            if waiting_message:
-                try: bot.delete_message(waiting_message.chat.id, waiting_message.message_id)
-                except Exception: pass
-            print(f"❌ 查询流程出错: {e}")
-            traceback.print_exc()
-            error_text = escape_markdown(f"❌ 查询失败，请稍后重试或联系管理员。错误: {type(e).__name__}")
-            bot.reply_to(message, error_text, parse_mode="MarkdownV2")
-            
     threading.Thread(target=perform_query_and_send_results, daemon=True).start()
 
-def send_query_result(message, query, resolved_id, db_history, verified_info, scam_channel_hits, common_groups, spoken_in_group_ids, phone_history, bio_history):
+
+def send_query_result(message, resolved_id, report_markdown, verified_info):
     chat_id = message.chat.id
-    message_parts_md = []
-    
-    # --- Risk Assessment ---
-    warning_source = None
-    if verified_info:
-        warning_source = "官方验证投稿"
-    elif scam_channel_hits:
-        warning_source = "反诈频道曝光"
-    if warning_source:
-        message_parts_md.append(f"🚨 *高风险警报* 🚨\n*{escape_markdown('风险来源:')}* {escape_markdown(warning_source)}")
-
-    # --- Main Profile Info (Handles missing DB data) ---
-    if db_history and db_history.get('current_profile'):
-        profile = db_history['current_profile']
-        profile_keys = profile.keys()
-        user_id = db_history['user_id']
-        display_name = (f"{profile['first_name'] or ''} {profile['last_name'] or ''}").strip()
-        
-        user_summary_parts = [f"👤 *{escape_markdown('用户资料')}*"]
-        user_summary_parts.append(f"› *ID:* `{user_id}`")
-        if display_name:
-            user_summary_parts.append(f"› *Name:* {escape_markdown(display_name)}")
-        
-        active_usernames = json.loads(profile['active_usernames_json']) if 'active_usernames_json' in profile_keys and profile['active_usernames_json'] else []
-        if active_usernames:
-            user_summary_parts.append(f"› *Username:* {', '.join([f'@{escape_markdown(u)}' for u in active_usernames])}")
-        if 'phone' in profile_keys and profile['phone']:
-            user_summary_parts.append(f"› *Phone:* `{escape_for_code(profile['phone'])}`")
-        if 'bio' in profile_keys and profile['bio']:
-            user_summary_parts.append(f"› *Bio:* {escape_markdown(profile['bio'])}")
-        
-        message_parts_md.append("\n".join(user_summary_parts))
-
-        business_parts = []
-        if 'business_bio' in profile_keys and profile['business_bio']:
-            business_parts.append(f"› *简介:* {escape_markdown(profile['business_bio'])}")
-        
-        if 'business_location_json' in profile_keys and profile['business_location_json']:
-            try:
-                loc_data = json.loads(profile['business_location_json'])
-                if loc_data.get('address'): business_parts.append(f"› *位置:* {escape_markdown(loc_data['address'])}")
-            except: pass
-
-        if 'business_work_hours_json' in profile_keys and profile['business_work_hours_json']:
-            try:
-                wh_data = json.loads(profile['business_work_hours_json'])
-                if wh_data and wh_data.get('periods'):
-                    periods = [f"{divmod(p['start_minute'], 60)[0]:02d}:{divmod(p['start_minute'], 60)[1]:02d}-{divmod(p['end_minute'], 60)[0]:02d}:{divmod(p['end_minute'], 60)[1]:02d}" for p in wh_data['periods']]
-                    business_parts.append(f"› *时间:* {escape_markdown(', '.join(periods))} ({wh_data.get('timezone_id', '')})")
-                else:
-                    business_parts.append(f"› *时间:* {escape_markdown('7 × 24 小时营业')}")
-            except: pass
-            
-        if business_parts:
-            message_parts_md.append(f"🏢 *{escape_markdown('营业信息')}*\n" + "\n".join(business_parts))
+    main_text = (report_markdown or '').strip()
+    if main_text:
+        full_message = (
+            f"{main_text}\n\n"
+            "*────────────────────*\n"
+            f"{ADVERTISEMENT_TEXT}"
+        )
     else:
-        user_id = resolved_id
-        header = f"👤 *{escape_markdown('用户资料 (信息受限)')}*"
-        id_line = f"› *ID:* `{user_id}`"
-        note_line = f"_{escape_markdown('注意：无法获取此用户的实时详细资料，可能因其隐私设置或已注销。')}_"
-        message_parts_md.append(f"{header}\n{id_line}\n{note_line}")
-        
-    # --- Scam Channel Hits ---
-    if scam_channel_hits:
-        risk_header = f"🔍 *{escape_markdown('风险记录')} \\({len(scam_channel_hits)} {escape_markdown('条')}\\)*"
-        risk_parts = [risk_header] + [f"› [{escape_markdown(_sanitize_for_link_text(hit['chat_title']))}]({hit['link']})" for hit in scam_channel_hits]
-        message_parts_md.append("\n".join(risk_parts))
+        full_message = ADVERTISEMENT_TEXT
 
-    # --- History Sections (if available) ---
-    profile_history = db_history.get('profile_history', []) if db_history else []
-    if len(profile_history) > 1:
-        history_header = f"📜 *{escape_markdown('历史变动')} \\({len(profile_history)} {escape_markdown('条')}\\)*"
-        event_blocks = []
-        for e in profile_history:
-            formatted_time = escape_for_code(datetime.fromtimestamp(e['timestamp'], tz=CHINA_TZ).strftime('%Y-%m-%d %H:%M'))
-            name_str = escape_for_code(e.get('name') or '无')
-            username_part = f"@{e.get('username')}" if e.get('username') else '无'
-            username_str = escape_markdown(username_part)
-            event_blocks.append(f"`{formatted_time}`\n › N: `{name_str}`\n › U: {username_str}")
-        
-        full_history_text = history_header + "\n" + "\n\n".join(event_blocks)
-        message_parts_md.append(full_history_text)
-
-
-    # --- Common Groups ---
-    all_common_groups_dict = {group['id']: group for group in common_groups}
-    if spoken_in_group_ids:
-        for chat_id_from_db in spoken_in_group_ids:
-            if chat_id_from_db not in all_common_groups_dict:
-                db_info = get_chat_info_from_db(chat_id_from_db)
-                if db_info: all_common_groups_dict[chat_id_from_db] = {'id': chat_id_from_db, 'title': db_info.get('title'), 'usernames': [db_info['username']] if db_info.get('username') else [], 'about': None}
-    if all_common_groups_dict:
-        group_list = sorted(all_common_groups_dict.values(), key=lambda g: str(g.get('title', '')).lower())
-        group_lines = []
-        for group in group_list:
-            title = group.get('title') or f"群组ID: {group.get('id')}"
-            public_usernames = [u for u in group.get('usernames', []) if u]
-            line_parts = ["›"]
-            if public_usernames:
-                line_parts.append(" ".join([f"@{escape_markdown(u)}" for u in public_usernames]) + " \\-")
-            else:
-                line_parts.append(escape_markdown("[私密]"))
-            line_parts.append(escape_markdown(title))
-            group_lines.append(" ".join(line_parts))
-        unique_group_lines = sorted(list(dict.fromkeys(group_lines)), key=str.lower)
-        group_header = f"👥 *{escape_markdown('共同群组')} \\({len(unique_group_lines)} {escape_markdown('个')}\\)*"
-        message_parts_md.append(f"{group_header}\n" + "\n".join(unique_group_lines))
-    
-    # --- Bio & Phone History ---
-    if bio_history:
-        bio_header = f"📝 *Bio {escape_markdown('历史')} \\({len(bio_history)} {escape_markdown('条')}\\)*"
-        message_parts_md.append(f"{bio_header}\n" + "\n\n".join([f"› `{escape_for_code(datetime.fromtimestamp(h['date'], tz=CHINA_TZ).strftime('%Y-%m-%d'))}`\n  `{escape_for_code((h['bio'] or '').strip() or '空')}`" for h in bio_history]))
-    if phone_history:
-        phone_header = f"📱 *{escape_markdown('绑定号码')} \\({len(phone_history)} {escape_markdown('个')}\\)*"
-        message_parts_md.append(f"{phone_header}\n" + "\n".join([f"› `{escape_for_code(phone)}`" for phone in phone_history]))
-        
-    # --- Final Assembly and Sending ---
-    main_text = "\n\n".join(filter(None, message_parts_md))
-    full_message = main_text.strip() + f"\n\n*────────────────────*\n{ADVERTISEMENT_TEXT}"
-    
     try:
         should_reply = not (message.text and message.text.startswith('/start bizChat'))
-        reply_params = ReplyParameters(message_id=message.message_id, allow_sending_without_reply=True) if should_reply else None
-        bot.send_message(chat_id, full_message, reply_parameters=reply_params, disable_web_page_preview=True, parse_mode="MarkdownV2")
+        reply_params = None
+        if should_reply:
+            reply_params = ReplyParameters(
+                message_id=message.message_id,
+                allow_sending_without_reply=True
+            )
+        bot.send_message(
+            chat_id,
+            full_message,
+            reply_parameters=reply_params,
+            disable_web_page_preview=True,
+            parse_mode="MarkdownV2"
+        )
     except ApiTelegramException as e:
         if "message is too long" in str(e).lower():
             try:
                 safe_main_text = re.sub(r'[_*`\\]', '', main_text)
-                file_content = f"--- User Report for {resolved_id} ---\n\n{safe_main_text}"
+                file_content = (
+                    f"--- User Report for {resolved_id} ---\n\n"
+                    f"{safe_main_text}"
+                )
                 file_to_send = io.BytesIO(file_content.encode('utf-8'))
                 file_to_send.name = f"report_{resolved_id}.txt"
-                summary_text = f"⚠️ *{escape_markdown('报告过长')}*\n{escape_markdown('详细报告已生成文件发送。')}\n\n{ADVERTISEMENT_TEXT}"
+                summary_text = (
+                    f"⚠️ *{escape_markdown('报告过长')}*\n"
+                    f"{escape_markdown('详细报告已生成文件发送。')}\n\n"
+                    f"{ADVERTISEMENT_TEXT}"
+                )
                 bot.send_message(chat_id, summary_text, parse_mode="MarkdownV2", disable_web_page_preview=True)
                 bot.send_document(chat_id, file_to_send)
             except Exception as file_e:
                 print(f"💥 创建或发送文件报告失败: {file_e}")
-                bot.send_message(chat_id, f"❌ {escape_markdown('报告过长且无法生成文件。')}", parse_mode="MarkdownV2")
+                error_text = f"❌ {escape_markdown('报告过长且无法生成文件。')}"
+                bot.send_message(chat_id, error_text, parse_mode="MarkdownV2")
         elif "message is not modified" not in str(e).lower():
-            safe_text = re.sub(r'[_*\[\]()~`>#+\-=|{}.!\\]', '', full_message)
-            fallback_message = (f"⚠️ 报告包含特殊字符，无法以格式化形式发送。以下是纯文本版本：\n\n{safe_text}")[:4096]
+            safe_text = re.sub(r'[_*\[\]()~`>#+\-=|{}.!\]', '', full_message)
+            fallback_message = (
+                "⚠️ 报告包含特殊字符，无法以格式化形式发送。以下是纯文本版本：\n\n"
+                f"{safe_text}"
+            )[:4096]
             bot.send_message(chat_id, fallback_message, disable_web_page_preview=True, parse_mode=None)
 
     if verified_info and verified_info.get('evidence_messages'):
-        bot.send_message(chat_id, f"*{escape_markdown('以下是官方验证投稿的证据：')}*", parse_mode="MarkdownV2")
+        notice_text = f"*{escape_markdown('以下是官方验证投稿的证据：')}*"
+        bot.send_message(chat_id, notice_text, parse_mode="MarkdownV2")
         for ev in verified_info['evidence_messages']:
             try:
                 bot.forward_message(chat_id, ev['chat_id'], ev['message_id'])
@@ -2501,9 +3523,6 @@ def send_query_result(message, query, resolved_id, db_history, verified_info, sc
                 print(f"❌ 转发证据失败: {e}")
                 bot.send_message(chat_id, f"_{escape_markdown('一份证据无法转发(可能已被删除)。')}_", parse_mode="MarkdownV2")
 
-# --- Tougao (投稿) handlers ---
-@bot.message_handler(commands=['tougao'])
-@check_membership
 def handle_tougao(message):
     update_active_user(message.from_user.id)
     user_id = message.from_user.id
@@ -2679,11 +3698,11 @@ def handle_submission_review(call):
         del reports['pending'][submission_id]
         save_reports(reports)
         
-        edit_text = f"✅ {escape_markdown('已批准投稿 ')}\`{escape_for_code(primary_key)}\`{escape_markdown('。')}"
+        edit_text = f"✅ {escape_markdown('已批准投稿 ')}{format_inline_code(primary_key)}{escape_markdown('。')}"
         bot.edit_message_text(edit_text, call.message.chat.id, call.message.message_id, reply_markup=None, parse_mode="MarkdownV2")
         bot.answer_callback_query(call.id, "已批准")
         try:
-            notify_text = f"🎉 *{escape_markdown('投稿已批准')}*\n{escape_markdown('好消息！您提交的关于')} `{escape_for_code(primary_key)}` {escape_markdown('的投稿已被管理员批准。感谢您的贡献！')}"
+            notify_text = f"🎉 *{escape_markdown('投稿已批准')}*\n{escape_markdown('好消息！您提交的关于')} {format_inline_code(primary_key)} {escape_markdown('的投稿已被管理员批准。感谢您的贡献！')}"
             bot.send_message(submitter_id, notify_text, parse_mode="MarkdownV2")
         except Exception as e:
             print(f"通知用户 {submitter_id} 批准失败: {e}")
@@ -3260,12 +4279,17 @@ def perform_background_scam_check(business_connection_id: str, chat_id: int, bus
         contact_name = (contact_user.first_name or "") + (" " + (contact_user.last_name or "") if contact_user.last_name else "")
         contact_name = contact_name.strip() or f"User ID {contact_id}"
         
-        username_mention = f"@{escape_markdown(contact_user.username)}" if contact_user.username else 'N/A'
+        username_mention = (
+            escape_markdown(f"@{contact_user.username}") if contact_user.username else escape_markdown('N/A')
+        )
+        left_paren = escape_markdown('(')
+        right_paren = escape_markdown(')')
+        pipe_symbol = escape_markdown('|')
 
         warning_message_md = (
             f"🚨 *{escape_markdown('安全警报 (自动检测)')}* 🚨\n\n"
             f"{escape_markdown('联系人')} *{escape_markdown(contact_name)}* "
-            f"\\({username_mention} \\| `{contact_id}`\\) "
+            f"{left_paren}{username_mention} {pipe_symbol} {format_inline_code(str(contact_id))}{right_paren} "
             f"{escape_markdown('存在高风险记录。')}\n\n"
             f"*{escape_markdown('原因:')}* {warning_reason}\n\n"
             f"*{escape_markdown('请谨慎交易，注意防范风险。')}*"
@@ -3758,7 +4782,8 @@ def handle_all_other_messages(message):
             '/start', '/cxzbf', '/stats', '/admin', '/addchannel',
             '/removechannel', '/listchannels', '/tougao', '/delreport',
             DONE_SUBMISSION_COMMAND, '/broadcast', '/cancel_broadcast',
-            '/premium_features', '/jz', '/sponsor', '/leaderboard'
+            '/premium_features', '/jz', '/sponsor', '/leaderboard',
+            '/webapp', '/setwebapp'
         ]
         if message.text.split()[0] not in known_commands:
             bot.reply_to(message, f"🤔 *{escape_markdown('无法识别的命令。')}*\n{escape_markdown('请使用')} /start {escape_markdown('查看可用命令。')}" + f"\n\n{ADVERTISEMENT_TEXT}", parse_mode="MarkdownV2")
@@ -3775,9 +4800,10 @@ if __name__ == '__main__':
         (CONFIG["REPORTS_FILE"], '{"pending": {}, "verified": {}}'),
     ]:
         if not os.path.exists(fname):
+            ensure_parent_dir(Path(fname))
             with open(fname, 'w', encoding='utf-8') as f: f.write(default_content)
             logger.info(f"📄 创建默认文件: {fname}")
-    
+
     init_db()
 
     # --- 启动顺序优化 ---
@@ -3836,7 +4862,7 @@ if __name__ == '__main__':
             logger.warning(f"⚠️ Telethon 断开连接超时或失败: {e}")
         
         if telethon_loop.is_running():
-             telethon_loop.call_soon_threadsafe(telethon_loop.stop)
+            telethon_loop.call_soon_threadsafe(telethon_loop.stop)
     
     if 'telethon_thread' in locals() and telethon_thread.is_alive():
         logger.info("⏳ 等待 Telethon 线程结束...")

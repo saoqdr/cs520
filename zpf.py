@@ -112,6 +112,14 @@ _webapp_url_loaded = False
 _webapp_url_override = None
 _webapp_url_explicit = False
 
+
+def row_to_dict(row):
+    """Safely convert a sqlite3.Row (or mapping) into a plain dict."""
+
+    if isinstance(row, sqlite3.Row):
+        return {key: row[key] for key in row.keys()}
+    return row
+
 for _cfg_key in ("CHANNELS_FILE", "REPORTS_FILE", "DATABASE_FILE"):
     if CONFIG.get(_cfg_key):
         CONFIG[_cfg_key] = resolve_project_path(CONFIG[_cfg_key])
@@ -1380,7 +1388,7 @@ def query_user_history_from_db(user_id: int):
         if not current_profile:
             conn.close()
             return None
-        history['current_profile'] = current_profile
+        history['current_profile'] = row_to_dict(current_profile)
 
         all_events = []
         c.execute("SELECT change_date, new_username as detail FROM username_history WHERE user_id = ?", (user_id,))
@@ -2642,6 +2650,8 @@ def handle_hidden_forward(message):
 
 def build_query_report_summary(resolved_id, db_history, verified_info, scam_channel_hits, common_groups,
                                spoken_in_group_ids, phone_history, bio_history):
+    if isinstance(db_history, sqlite3.Row):
+        db_history = row_to_dict(db_history) or {}
     summary = {
         'resolved_id': resolved_id,
         'risk_source': '官方验证投稿' if verified_info else ('反诈频道曝光' if scam_channel_hits else None),
@@ -2657,7 +2667,7 @@ def build_query_report_summary(resolved_id, db_history, verified_info, scam_chan
 
     if db_history and db_history.get('current_profile'):
         profile_raw = db_history['current_profile']
-        profile = dict(profile_raw) if isinstance(profile_raw, sqlite3.Row) else profile_raw
+        profile = row_to_dict(profile_raw) or {}
         display_name = (f"{profile.get('first_name') or ''} {profile.get('last_name') or ''}").strip()
         active_usernames = []
         if profile.get('active_usernames_json'):
@@ -2712,6 +2722,7 @@ def build_query_report_summary(resolved_id, db_history, verified_info, scam_chan
 
     profile_history = db_history.get('profile_history', []) if db_history else []
     for entry in profile_history:
+        entry = row_to_dict(entry) or {}
         timestamp = entry.get('timestamp')
         display_time = None
         if timestamp:
@@ -3443,9 +3454,6 @@ def trigger_query_flow(message, query):
         bot.reply_to(message, error_text, parse_mode="MarkdownV2")
 
     threading.Thread(target=perform_query_and_send_results, daemon=True).start()
-
-    threading.Thread(target=perform_query_and_send_results, daemon=True).start()
-
 
 def send_query_result(message, resolved_id, report_markdown, verified_info):
     chat_id = message.chat.id
